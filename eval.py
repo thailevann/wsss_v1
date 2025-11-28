@@ -121,6 +121,8 @@ def main():
                        help="Confidence threshold for pseudo mask")
     parser.add_argument("--num_visualize", type=int, default=3,
                        help="Number of samples to visualize")
+    parser.add_argument("--save_pseudo_dir", type=str, default=None,
+                       help="Directory to save pseudo masks (optional)")
     
     args = parser.parse_args()
     
@@ -190,6 +192,7 @@ def main():
     fn_cls = torch.zeros(NUM_CLASSES, device=device)
     tn_cls = torch.zeros(NUM_CLASSES, device=device)
     visual_samples = []
+    pseudo_outputs = []
     
     for i, img_path in tqdm(list(enumerate(val_images)), total=len(val_images),
                              desc="Evaluating Pseudo Masks with CAA"):
@@ -326,13 +329,15 @@ def main():
         fn_cls += ((1.0 - pred_labels) * gt_labels)
         tn_cls += ((1.0 - pred_labels) * (1.0 - gt_labels))
 
+        sample = {
+            "img": np.array(img_pil.resize((224, 224))),
+            "pred": pred_mask.cpu().numpy(),
+            "gt": gt_mask.cpu().numpy(),
+            "name": os.path.basename(img_path),
+        }
         if len(visual_samples) < args.num_visualize:
-            visual_samples.append({
-                "img": np.array(img_pil.resize((224, 224))),
-                "pred": pred_mask.cpu().numpy(),
-                "gt": gt_mask.cpu().numpy(),
-                "name": os.path.basename(img_path),
-            })
+            visual_samples.append(sample)
+        pseudo_outputs.append(sample)
 
     # Calculate mIoU
     ious = []
@@ -385,6 +390,14 @@ def main():
         )
     )
     print("=" * 40)
+
+    if args.save_pseudo_dir:
+        os.makedirs(args.save_pseudo_dir, exist_ok=True)
+        for sample in pseudo_outputs:
+            out_path = os.path.join(args.save_pseudo_dir, sample["name"])
+            mask = Image.fromarray(sample["pred"].astype(np.uint8))
+            mask.save(out_path)
+        print(f"[INFO] Saved {len(pseudo_outputs)} pseudo masks to {args.save_pseudo_dir}")
 
     # Visualize
     if visual_samples:

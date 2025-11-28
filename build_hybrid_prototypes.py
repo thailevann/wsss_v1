@@ -41,7 +41,13 @@ def main():
     print(f"\n[OK] Saved hybrid prototypes to: {output_path}")
     print(f"Feature dimension: {hybrid_bank['feat_dim']}")
     for c, proto in hybrid_bank["hybrid_prototypes"].items():
-        print(f"  {c:24s}: {tuple(proto.shape)}")
+        meta = hybrid_bank["meta_info"].get(c, {})
+        print(
+            f"  {c:24s}: {tuple(proto.shape)} "
+            f"(alpha_v={meta.get('alpha_v', float('nan')):.2f}, "
+            f"vision={meta.get('num_vision_protos', 'N/A')}, "
+            f"text={meta.get('num_text_prompts', 'N/A')})"
+        )
 
 
 if __name__ == "__main__":
