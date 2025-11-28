@@ -166,7 +166,16 @@ def main():
     
     print(f"Using INPUT_DIM={INPUT_DIM}, PROTO_DIM={PROTO_DIM}")
     
-    classnet = ClassNetPP(hybrid_bank["hybrid_prototypes"], classes_no_bg, INPUT_DIM, PROTO_DIM).to(device)
+    noise_tensor = ckpt["state_dict"].get("prograd.noise_protos")
+    if noise_tensor is not None:
+        noise_tensor = noise_tensor.to(device)
+    classnet = ClassNetPP(
+        hybrid_bank["hybrid_prototypes"],
+        classes_no_bg,
+        INPUT_DIM,
+        PROTO_DIM,
+        noise_protos=noise_tensor,
+    ).to(device)
     classnet.load_state_dict(ckpt["state_dict"])
     classnet.eval()
     print("Model loaded for evaluation.")

@@ -15,12 +15,112 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 import clip
 from model.classnet import ClassNetPP
 from model.clip_encoder import encode_image_to_tokens
 from dataloader import load_training_data, create_evaluation_dataloader, build_targets
-from utils import compute_presence_metrics
+from utils import compute_presence_metrics, CLASS_COLOR_MAP, BACKGROUND_COLOR
+
+
+# -----------------------------------------------------------------------------
+# Visualization helpers
+# -----------------------------------------------------------------------------
+def _colorize_index_mask(index_mask: np.ndarray, classes: List[str]) -> np.ndarray:
+    h, w = index_mask.shape
+    canvas = np.full((h, w, 3), BACKGROUND_COLOR, dtype=np.uint8)
+    for idx, cls in enumerate(classes):
+        color = CLASS_COLOR_MAP.get(cls)
+        if color is None:
+            continue
+        canvas[index_mask == idx] = color
+    return canvas
+
+
+@torch.no_grad()
+def _create_pseudo_mask(act_maps: torch.Tensor, logits: torch.Tensor, threshold: float) -> torch.Tensor:
+    """
+    Build pseudo mask from activation maps and class logits.
+    act_maps: [1, C, H, W]
+    logits: [1, C]
+    Returns: [H', W'] long tensor with class indices, -1 = background.
+    """
+    cams = act_maps.clone()
+    cams = F.interpolate(cams, size=(224, 224), mode="bilinear", align_corners=False)
+    cams = cams.squeeze(0)  # [C, H, W]
+
+    probs = torch.sigmoid(logits.squeeze(0))
+    inactive = (probs <= threshold)
+    if inactive.any():
+        cams[inactive, :, :] = -1e6
+
+    max_vals, pred_idx = cams.max(dim=0)
+    pred_idx = torch.where(max_vals > -1e5, pred_idx, torch.full_like(pred_idx, -1))
+    return pred_idx
+
+
+@torch.no_grad()
+def visualize_val_samples(
+    model: ClassNetPP,
+    dataset,
+    clip_model,
+    classes: List[str],
+    device: torch.device,
+    threshold: float,
+    epoch: int,
+    output_dir: str,
+    num_samples: int = 10,
+) -> List[str]:
+    if dataset is None or len(dataset) == 0 or num_samples <= 0:
+        return []
+
+    os.makedirs(output_dir, exist_ok=True)
+    indices = list(range(min(num_samples, len(dataset))))
+    saved_paths: List[str] = []
+    model.eval()
+
+    for local_idx, ds_idx in enumerate(indices):
+        try:
+            img_tensor, gt_mask, _, img_path = dataset[ds_idx]
+        except Exception:
+            continue
+
+        try:
+            raw_img = Image.open(img_path).convert("RGB")
+        except Exception:
+            continue
+
+        img_batch = img_tensor.unsqueeze(0).to(device)
+        tokens = encode_image_to_tokens(clip_model, img_batch)
+        logits, act_maps, _ = model(tokens[:, 1:])
+
+        pseudo_idx = _create_pseudo_mask(act_maps, logits, threshold)
+        pseudo_np = pseudo_idx.cpu().numpy()
+
+        gt_np = gt_mask.numpy() if isinstance(gt_mask, torch.Tensor) else np.array(gt_mask)
+
+        pseudo_rgb = _colorize_index_mask(pseudo_np, classes)
+        gt_rgb = _colorize_index_mask(gt_np, classes)
+
+        fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+        axes[0].imshow(raw_img)
+        axes[0].set_title("Image")
+        axes[1].imshow(gt_rgb)
+        axes[1].set_title("Ground Truth")
+        axes[2].imshow(pseudo_rgb)
+        axes[2].set_title("Pseudo Mask")
+        for ax in axes:
+            ax.axis("off")
+
+        out_path = os.path.join(output_dir, f"epoch{epoch:02d}_idx{local_idx:02d}.png")
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+
+        saved_paths.append(out_path)
+
+    return saved_paths
 
 
 # -----------------------------------------------------------------------------
@@ -216,6 +316,7 @@ def compute_split_val_accuracy(
     classes: List[str],
     device: torch.device,
     batch_size: int,
+    threshold: float,
 ) -> float:
     model.eval()
     total_correct = 0.0
@@ -234,14 +335,14 @@ def compute_split_val_accuracy(
             tokens = encode_image_to_tokens(clip_model, imgs)
             logits, _, _ = model(tokens[:, 1:])
 
-            preds = (torch.sigmoid(logits) > 0.5).float()
+            preds = (torch.sigmoid(logits) > threshold).float()
             total_correct += (preds == targets).sum().item()
             total_elems += preds.numel()
 
     return (total_correct / total_elems * 100.0) if total_elems > 0 else 0.0
 
 
-def validate(model, val_loader, classes, clip_model, device):
+def validate(model, val_loader, classes, clip_model, device, threshold: float):
     """Validate model on mask-derived labels."""
     model.eval()
     num_classes = len(classes)
@@ -250,6 +351,8 @@ def validate(model, val_loader, classes, clip_model, device):
     fn = torch.zeros(num_classes, device=device)
     tn = torch.zeros(num_classes, device=device)
     total_samples = 0
+    pred_pos = torch.zeros(num_classes, device=device)
+    prob_sum = torch.zeros(num_classes, device=device)
 
     with torch.no_grad():
         for batch in val_loader:
@@ -266,7 +369,10 @@ def validate(model, val_loader, classes, clip_model, device):
             toks = encode_image_to_tokens(clip_model, imgs)
             logits, _, _ = model(toks[:, 1:])
 
-            preds = (torch.sigmoid(logits) > 0.5).float()
+            probs = torch.sigmoid(logits)
+            preds = (probs > threshold).float()
+            pred_pos += preds.sum(dim=0)
+            prob_sum += probs.sum(dim=0)
 
             tp += (preds * label_vecs).sum(dim=0)
             fp += (preds * (1.0 - label_vecs)).sum(dim=0)
@@ -279,6 +385,11 @@ def validate(model, val_loader, classes, clip_model, device):
 
     metrics = compute_presence_metrics(tp, fp, fn, tn, classes)
     metrics["summary"]["num_samples"] = total_samples
+    metrics["summary"]["pred_pos_counts"] = pred_pos.detach().cpu().tolist()
+    metrics["summary"]["mean_probs"] = (prob_sum / max(total_samples, 1)).detach().cpu().tolist()
+    for cls_idx, cls in enumerate(classes):
+        metrics["per_class"][cls]["predicted"] = float(pred_pos[cls_idx].item())
+        metrics["per_class"][cls]["mean_prob"] = float(prob_sum[cls_idx].item() / max(total_samples, 1))
     return metrics
 
 
@@ -432,6 +543,7 @@ def main():
         batch_size=args.batch_size,
         device="cpu",  # keep dataset tensors on CPU; move to GPU during validation step
     )
+    val_dataset = val_loader.dataset if len(val_loader.dataset) > 0 else None
     if len(val_loader.dataset) == 0:
         print(f"[WARN] No validation samples found in {val_img_dir} / {val_mask_dir}")
 
@@ -520,22 +632,37 @@ def main():
                 classes_no_bg,
                 device,
                 args.batch_size,
+                args.presence_threshold,
             )
             print(f"[Val Ep {epoch}] Mean label ACC: {val_label_acc_metric:.2f}%")
 
         # Mask-driven validation metrics (requested earlier)
         print("Validating...")
-        val_results = validate(classnet, val_loader, classes_no_bg, clip_model, device)
+        val_results = validate(
+            classnet,
+            val_loader,
+            classes_no_bg,
+            clip_model,
+            device,
+            threshold=args.presence_threshold,
+        )
         print("-" * 40)
         if val_results is None:
             print("No validation samples available for evaluation.")
         else:
             summary = val_results["summary"]
             per_class = val_results["per_class"]
+            num_samples = max(1, summary.get("num_samples", 0))
             print(f"Samples evaluated: {summary.get('num_samples', 0)}")
             for cls, cls_metrics in per_class.items():
+                pred_count = cls_metrics.get("predicted", 0.0)
+                pred_ratio = pred_count / num_samples * 100.0
+                mean_prob = cls_metrics.get("mean_prob", 0.0) * 100.0
                 print(
                     f"  >> {cls:25}: "
+                    f"Supp {cls_metrics['support']:.0f} | "
+                    f"Pred+ {pred_count:.0f} ({pred_ratio:.1f}%) | "
+                    f"P̄ {mean_prob:.1f}% | "
                     f"Acc {cls_metrics['accuracy']*100:.2f}% | "
                     f"Prec {cls_metrics['precision']*100:.2f}% | "
                     f"Rec {cls_metrics['recall']*100:.2f}% | "
@@ -544,6 +671,24 @@ def main():
                     f"Dice {cls_metrics['dice']*100:.2f}% | "
                     f"bIoU {cls_metrics['biou']*100:.2f}%"
                 )
+            preview_paths = []
+            if val_dataset is not None:
+                preview_paths = visualize_val_samples(
+                    classnet,
+                    val_dataset,
+                    clip_model,
+                    classes_no_bg,
+                    device,
+                    args.presence_threshold,
+                    epoch,
+                    os.path.join(args.data_root, "val_previews"),
+                    num_samples=10,
+                )
+                if preview_paths:
+                    summary["viz_samples"] = preview_paths
+                    print(f"[Viz] Saved validation previews: {len(preview_paths)} images")
+                    for saved_path in preview_paths:
+                        print(f"  - {saved_path}")
             print("-" * 40)
             print(
                 "Mean Acc {0:.2f}% | Mean Prec {1:.2f}% | Mean Rec {2:.2f}% | Mean F1 {3:.2f}%".format(
