@@ -5,7 +5,7 @@ import os
 import glob
 import argparse
 import numpy as np
-from typing import List, Dict
+from typing import List, Dict, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -123,7 +123,27 @@ def main():
                        help="Number of samples to visualize")
     parser.add_argument("--save_pseudo_dir", type=str, default=None,
                        help="Directory to save pseudo masks (optional)")
-    
+    parser.add_argument("--no_caa", action="store_true",
+                       help="Skip CAA refinement and use raw CAMs")
+    parser.add_argument("--single_image_path", type=str, default=None,
+                       help="Optional single image path for standalone pseudo mask generation")
+    parser.add_argument("--single_mask_path", type=str, default=None,
+                       help="Optional ground-truth mask for the single image")
+    parser.add_argument("--single_save_path", type=str, default=None,
+                       help="Path to save the single-image visualization (default: data_root/single_pseudo.png)")
+    parser.add_argument("--single_show", action="store_true",
+                       help="Display the single-image visualization instead of just saving")
+    parser.add_argument("--no_caa", action="store_true",
+                    help="Skip CAA refinement and use raw CAMs")
+
+    # Trong phần xử lý CAM (khoảng dòng 282-285), thay bằng:
+    if args.no_caa:
+        refined_cam_tok = cam_norm_tok  # Dùng CAM gốc, không refine
+    else:
+        refined_cam_tok = caa_refinement(
+            cam_norm_tok, token_feats, 
+            t=args.caa_attn_power, lambda_thr=args.caa_thr
+        )
     args = parser.parse_args()
     
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -192,6 +212,110 @@ def main():
     classnet.eval()
     print("Model loaded for evaluation.")
     
+    use_caa = not args.no_caa
+    if not use_caa:
+        print("[INFO] CAA refinement disabled. Using raw CAMs for pseudo masks.")
+    
+    def infer_pseudo_mask(
+        img_pil: Image.Image,
+        class_filter: Optional[List[str]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generate pseudo mask and averaged CAM tensor for a single image.
+        Returns (pred_mask, P_resized). Both tensors are on the evaluation device.
+        """
+        class_filter_set = set(class_filter) if class_filter else None
+        refined_cams_per_scale: List[torch.Tensor] = []
+
+        with torch.no_grad():
+            for scale in args.scales:
+                if scale != 1.0:
+                    new_size = (int(img_pil.width * scale), int(img_pil.height * scale))
+                    img_in = img_pil.resize(new_size, Image.BICUBIC)
+                else:
+                    img_in = img_pil
+
+                pp = clip_preprocess(img_in)
+                inp = pp.unsqueeze(0).to(device)
+                target_size = pp.shape[-2:]
+
+                toks = encode_image_to_tokens(clip_model, inp)
+                _, act_maps, patch_feats_norm = classnet(toks[:, 1:])
+                act_maps = act_maps.squeeze(0)
+
+                token_feats = patch_feats_norm.squeeze(0)
+                H_tok = W_tok = int(token_feats.shape[0] ** 0.5)
+
+                cams_hi = F.interpolate(
+                    act_maps.unsqueeze(0),
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+
+                refined = torch.zeros_like(cams_hi)
+
+                for ci, c in enumerate(classes_no_bg):
+                    if class_filter_set is not None and c not in class_filter_set:
+                        continue
+
+                    cam = cams_hi[ci]
+                    cam_norm = (cam - cam.min()) / (cam.max() + 1e-7)
+
+                    cam_norm_tok = F.interpolate(
+                        cam_norm.unsqueeze(0).unsqueeze(0),
+                        size=(H_tok, W_tok),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0).squeeze(0)
+
+                    if use_caa:
+                        refined_cam_tok = caa_refinement(
+                            cam_norm_tok,
+                            token_feats,
+                            t=args.caa_attn_power,
+                            lambda_thr=args.caa_thr,
+                        )
+                    else:
+                        refined_cam_tok = cam_norm_tok
+
+                    refined_cam = F.interpolate(
+                        refined_cam_tok.unsqueeze(0).unsqueeze(0),
+                        size=target_size,
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0).squeeze(0)
+
+                    refined[ci] = refined_cam
+
+                refined_cams_per_scale.append(refined)
+
+        if not refined_cams_per_scale:
+            return None, None
+
+        cams_stack = torch.stack(refined_cams_per_scale, dim=0)
+        P = cams_stack.mean(dim=0)
+
+        if P.shape[1:] != (224, 224):
+            P_resized = F.interpolate(
+                P.unsqueeze(0),
+                size=(224, 224),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+        else:
+            P_resized = P
+
+        max_vals, pred_mask = P_resized.max(dim=0)
+        ignore_label = -1
+        pred_mask = torch.where(
+            max_vals > args.conf_thr,
+            pred_mask,
+            torch.full_like(pred_mask, ignore_label),
+        )
+
+        return pred_mask, P_resized
+    
     # Evaluation
     val_images = sorted(glob.glob(os.path.join(val_img_dir, "*.png")))
     print(f"Evaluating on {len(val_images)} test images...")
@@ -204,8 +328,9 @@ def main():
     visual_samples = []
     pseudo_outputs = []
     
+    eval_desc = "Evaluating Pseudo Masks (CAA)" if use_caa else "Evaluating Pseudo Masks (No CAA)"
     for i, img_path in tqdm(list(enumerate(val_images)), total=len(val_images),
-                             desc="Evaluating Pseudo Masks with CAA"):
+                             desc=eval_desc):
         mask_path = os.path.join(val_mask_dir, os.path.basename(img_path))
         if not os.path.exists(mask_path):
             continue
@@ -234,91 +359,9 @@ def main():
         if not lbls:
             continue
 
-        refined_cams_per_scale = []
-
-        with torch.no_grad():
-            for scale in args.scales:
-                if scale != 1.0:
-                    new_size = (int(img_pil.width * scale),
-                                int(img_pil.height * scale))
-                    img_in = img_pil.resize(new_size, Image.BICUBIC)
-                else:
-                    img_in = img_pil
-
-                pp = clip_preprocess(img_in)
-                inp = pp.unsqueeze(0).to(device)
-                target_size = pp.shape[-2:]
-
-                toks = encode_image_to_tokens(clip_model, inp)
-                _, act_maps, patch_feats_norm = classnet(toks[:, 1:])
-                act_maps = act_maps.squeeze(0)
-                
-                token_feats = patch_feats_norm.squeeze(0)
-                H_tok = W_tok = int(token_feats.shape[0] ** 0.5)
-
-                cams_hi = F.interpolate(
-                    act_maps.unsqueeze(0),
-                    size=target_size,
-                    mode="bilinear",
-                    align_corners=False
-                ).squeeze(0)
-
-                refined = torch.zeros_like(cams_hi)
-
-                for ci, c in enumerate(classes_no_bg):
-                    if c not in lbls:
-                        continue
-
-                    cam = cams_hi[ci]
-                    cam_norm = (cam - cam.min()) / (cam.max() + 1e-7)
-
-                    cam_norm_tok = F.interpolate(
-                        cam_norm.unsqueeze(0).unsqueeze(0),
-                        size=(H_tok, W_tok),
-                        mode="bilinear",
-                        align_corners=False
-                    ).squeeze(0).squeeze(0)
-
-                    refined_cam_tok = caa_refinement(
-                        cam_norm_tok, token_feats, 
-                        t=args.caa_attn_power, lambda_thr=args.caa_thr
-                    )
-                    
-                    refined_cam = F.interpolate(
-                        refined_cam_tok.unsqueeze(0).unsqueeze(0),
-                        size=target_size,
-                        mode="bilinear",
-                        align_corners=False
-                    ).squeeze(0).squeeze(0)
-                    
-                    refined[ci] = refined_cam
-
-                refined_cams_per_scale.append(refined)
-
-        if not refined_cams_per_scale:
+        pred_mask, P_resized = infer_pseudo_mask(img_pil, class_filter=lbls)
+        if pred_mask is None:
             continue
-
-        cams_stack = torch.stack(refined_cams_per_scale, dim=0)
-        P = cams_stack.mean(dim=0)
-
-        if P.shape[1:] != (224, 224):
-            P_resized = F.interpolate(
-                P.unsqueeze(0),
-                size=(224, 224),
-                mode="bilinear",
-                align_corners=False
-            ).squeeze(0)
-        else:
-            P_resized = P
-
-        max_vals, pred_mask = P_resized.max(dim=0)
-        ignore_label = -1
-
-        pred_mask = torch.where(
-            max_vals > args.conf_thr,
-            pred_mask,
-            torch.full_like(pred_mask, ignore_label)
-        )
 
         valid = (gt_mask >= 0) & (gt_mask < NUM_CLASSES) & (pred_mask >= 0)
         if valid.sum() == 0:
@@ -352,7 +395,7 @@ def main():
     # Calculate mIoU
     ious = []
     print("\n" + "=" * 40)
-    print("PSEUDO MASK EVALUATION RESULTS (CAA)")
+    print(f"PSEUDO MASK EVALUATION RESULTS ({'CAA' if use_caa else 'No CAA'})")
     print("=" * 40)
 
     for i, c in enumerate(classes_no_bg):
@@ -409,11 +452,11 @@ def main():
             mask.save(out_path)
         print(f"[INFO] Saved {len(pseudo_outputs)} pseudo masks to {args.save_pseudo_dir}")
 
+    cmap = mcolors.ListedColormap(['red', 'green', 'blue', 'yellow'])
+    norm = mcolors.BoundaryNorm(np.arange(NUM_CLASSES + 1) - 0.5, NUM_CLASSES)
+
     # Visualize
     if visual_samples:
-        cmap = mcolors.ListedColormap(['red', 'green', 'blue', 'yellow'])
-        norm = mcolors.BoundaryNorm(np.arange(NUM_CLASSES + 1) - 0.5, NUM_CLASSES)
-
         fig, axes = plt.subplots(len(visual_samples), 3,
                                  figsize=(15, 5 * len(visual_samples)))
         if len(visual_samples) == 1:
@@ -435,9 +478,95 @@ def main():
             axes[idx, 2].axis("off")
 
         plt.tight_layout()
-        save_name = f"eval_caaP{args.caa_attn_power}_thr{args.caa_thr}_conf{args.conf_thr}.png"
+        if use_caa:
+            save_name = f"eval_caaP{args.caa_attn_power}_thr{args.caa_thr}_conf{args.conf_thr}.png"
+        else:
+            save_name = f"eval_noCAA_conf{args.conf_thr}.png"
         plt.savefig(os.path.join(args.data_root, save_name))
         print(f"\nVisualization saved to {os.path.join(args.data_root, save_name)}")
+
+    if args.single_image_path:
+        single_path = args.single_image_path
+        print(f"\n[INFO] Generating pseudo mask for single image: {single_path}")
+
+        if not os.path.exists(single_path):
+            print(f"[WARNING] Single image path not found: {single_path}")
+        else:
+            try:
+                single_img_pil = Image.open(single_path).convert("RGB")
+            except Exception as exc:
+                print(f"[WARNING] Failed to open image {single_path}: {exc}")
+                single_img_pil = None
+
+            gt_np = None
+            class_filter_single: Optional[List[str]] = None
+
+            if single_img_pil is not None and args.single_mask_path:
+                mask_path = args.single_mask_path
+                if os.path.exists(mask_path):
+                    try:
+                        mask_pil = Image.open(mask_path)
+                        mask_indices, present_classes = mask_to_class_indices(mask_pil, classes_no_bg)
+                        gt_mask = torch.from_numpy(mask_indices).long().to(device)
+                        gt_mask = F.interpolate(
+                            gt_mask[None, None].float(),
+                            size=(224, 224),
+                            mode="nearest",
+                        ).squeeze(0).squeeze(0).long()
+                        gt_np = gt_mask.cpu().numpy()
+                        class_filter_single = present_classes
+                    except Exception as exc:
+                        print(f"[WARNING] Failed to load mask {mask_path}: {exc}")
+                else:
+                    print(f"[WARNING] Single mask path not found: {mask_path}")
+
+            if single_img_pil is not None:
+                pred_mask_single, _ = infer_pseudo_mask(single_img_pil, class_filter=class_filter_single)
+                if pred_mask_single is None:
+                    print("[WARNING] Unable to generate pseudo mask for the provided image.")
+                else:
+                    pred_np = pred_mask_single.cpu().numpy()
+                    fig_cols = 3 if gt_np is not None else 2
+                    fig, axes = plt.subplots(1, fig_cols, figsize=(5 * fig_cols, 5))
+
+                    axes = np.atleast_1d(axes)
+                    axes[0].imshow(single_img_pil.resize((224, 224)))
+                    axes[0].set_title("Input Image")
+                    axes[0].axis("off")
+
+                    if gt_np is not None:
+                        axes[1].imshow(gt_np, cmap=cmap, norm=norm, interpolation="nearest")
+                        axes[1].set_title("Ground Truth Mask")
+                        axes[1].axis("off")
+                        pred_axis = axes[2]
+                    else:
+                        pred_axis = axes[1]
+
+                    pred_axis.imshow(pred_np, cmap=cmap, norm=norm, interpolation="nearest")
+                    pred_axis.set_title("Pseudo Mask Prediction")
+                    pred_axis.axis("off")
+
+                    plt.tight_layout()
+
+                    default_name = os.path.splitext(os.path.basename(single_path))[0]
+                    if args.single_save_path:
+                        single_save_path = args.single_save_path
+                        save_dir = os.path.dirname(single_save_path)
+                        if save_dir:
+                            os.makedirs(save_dir, exist_ok=True)
+                    else:
+                        single_save_path = os.path.join(
+                            args.data_root, f"single_pseudo_{default_name}.png"
+                        )
+                        os.makedirs(os.path.dirname(single_save_path), exist_ok=True)
+
+                    plt.savefig(single_save_path)
+                    print(f"[INFO] Single-image visualization saved to {single_save_path}")
+
+                    if args.single_show:
+                        plt.show()
+                    else:
+                        plt.close(fig)
 
 
 if __name__ == "__main__":
