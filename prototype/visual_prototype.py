@@ -173,7 +173,7 @@ def build_visual_prototypes(
                 )
             image_features = F.normalize(image_features, p=2, dim=-1)
 
-            tokens = encode_image_to_tokens(clip_model, images_tensor)
+            tokens = encode_image_to_tokens(clip_model, images_tensor, project=True)
             patch_feats = tokens[:, 1:, :]  # drop CLS token
             if patch_feats.shape[-1] != feat_dim:
                 raise ValueError(

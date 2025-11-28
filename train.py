@@ -2,6 +2,7 @@
 Train ClassNet++ with ProGrad and background-aware regularization.
 """
 import os
+import glob
 import argparse
 import random
 from collections import defaultdict
@@ -307,7 +308,7 @@ def main():
     parser.add_argument("--bg_margin", type=float, default=0.05, help="Background margin hinge")
     parser.add_argument("--tau", type=float, default=0.25, help="Softmax temperature for ClassNet++")
     parser.add_argument("--prograd_alpha", type=float, default=0.7, help="Soft ProGrad alpha (0-1)")
-    parser.add_argument("--val_split", type=float, default=0.2, help="Validation split for label accuracy monitoring")
+    parser.add_argument("--val_split", type=float, default=0.0, help="Validation split for label accuracy monitoring")
     parser.add_argument("--val_img_dir", type=str, default=None,
                         help="Validation image directory (default: data_root/val/img)")
     parser.add_argument("--val_mask_dir", type=str, default=None,
@@ -327,6 +328,14 @@ def main():
     train_dir = args.train_dir or os.path.join(args.data_root, "training")
     val_img_dir = args.val_img_dir or os.path.join(args.data_root, "val", "img")
     val_mask_dir = args.val_mask_dir or os.path.join(args.data_root, "val", "mask")
+    val_images = glob.glob(os.path.join(val_img_dir, "*.png"))
+    val_masks = glob.glob(os.path.join(val_mask_dir, "*.png"))
+    use_external_val = len(val_images) > 0 and len(val_masks) > 0
+    val_split = args.val_split
+    if use_external_val and val_split > 0:
+        print(f"[INFO] Detected external validation set at {val_img_dir}. "
+              f"Ignoring val_split={val_split} and using full training set.")
+        val_split = 0.0
     
     # Load CLIP
     print(f"Loading CLIP model: {args.clip_model}")
@@ -401,10 +410,14 @@ def main():
     train_img_paths, train_labels, train_indices, val_indices = load_training_data(
         train_dir,
         classes_no_bg,
-        val_split=args.val_split,
+        val_split=val_split,
         seed=args.seed,
     )
-    print(f"Data Split: Train={len(train_indices)} | Val={len(val_indices)}")
+    if val_split > 0:
+        print(f"Data Split: Train={len(train_indices)} | Val={len(val_indices)} "
+              f"(val_split={val_split:.2f})")
+    else:
+        print(f"Training samples: {len(train_indices)} (no train/val split applied).")
     
     # Validation loader (mask-driven metrics)
     val_loader = create_evaluation_dataloader(
@@ -495,18 +508,20 @@ def main():
         )
 
         # Monitor label accuracy on held-out split
-        val_label_acc = compute_split_val_accuracy(
-            classnet,
-            clip_model,
-            train_img_paths,
-            train_labels,
-            val_indices,
-            eval_transform,
-            classes_no_bg,
-            device,
-            args.batch_size,
-        )
-        print(f"[Val Ep {epoch}] Mean label ACC: {val_label_acc:.2f}%")
+        val_label_acc_metric = None
+        if val_indices:
+            val_label_acc_metric = compute_split_val_accuracy(
+                classnet,
+                clip_model,
+                train_img_paths,
+                train_labels,
+                val_indices,
+                eval_transform,
+                classes_no_bg,
+                device,
+                args.batch_size,
+            )
+            print(f"[Val Ep {epoch}] Mean label ACC: {val_label_acc_metric:.2f}%")
 
         # Mask-driven validation metrics (requested earlier)
         print("Validating...")
@@ -529,7 +544,7 @@ def main():
                     f"Dice {cls_metrics['dice']*100:.2f}% | "
                     f"bIoU {cls_metrics['biou']*100:.2f}%"
                 )
-        print("-" * 40)
+            print("-" * 40)
             print(
                 "Mean Acc {0:.2f}% | Mean Prec {1:.2f}% | Mean Rec {2:.2f}% | Mean F1 {3:.2f}%".format(
                     summary["mean_accuracy"] * 100,
@@ -564,7 +579,9 @@ def main():
                             "lambda_bg_margin": args.lambda_bg_margin,
                             "bg_sim_thr": args.bg_sim_thr,
                             "bg_margin": args.bg_margin,
-                            "val_label_acc": val_label_acc,
+                            "val_label_acc": (
+                                val_label_acc_metric if val_label_acc_metric is not None else mean_acc
+                            ),
                         },
                     },
                     best_ckpt_path,

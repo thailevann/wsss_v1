@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 
-def encode_image_to_tokens(model, images: torch.Tensor):
+def encode_image_to_tokens(model, images: torch.Tensor, project: bool = False):
     """
     Encode images to patch tokens using frozen CLIP
     Returns: [B, 1+N, D] where D is the feature dimension
@@ -31,5 +31,11 @@ def encode_image_to_tokens(model, images: torch.Tensor):
     x = v.ln_pre(x).permute(1, 0, 2)
     x = v.transformer(x).permute(1, 0, 2)
     x = v.ln_post(x)
+
+    # Project to CLIP embedding dim (e.g., 512 for ViT-B/16)
+    if project and hasattr(v, "proj") and v.proj is not None:
+        proj = v.proj.to(x.dtype)
+        x = x @ proj
+
     return x  # [B, 1+N, Din]
 
