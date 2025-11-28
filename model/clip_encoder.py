@@ -11,7 +11,9 @@ def encode_image_to_tokens(model, images: torch.Tensor):
     Returns: [B, 1+N, D] where D is the feature dimension
     """
     v = model.visual
-    x = v.conv1(images)             # [B, Din, H, W]
+    dtype = v.conv1.weight.dtype
+
+    x = v.conv1(images.to(dtype))   # [B, Din, H, W]
     x = x.reshape(x.shape[0], x.shape[1], -1)
     x = x.permute(0, 2, 1)          # [B, N, Din]
 
