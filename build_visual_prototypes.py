@@ -45,6 +45,7 @@ def main():
     device = args.device if torch.cuda.is_available() else "cpu"
     clip_model, clip_preprocess = clip.load(args.clip_model, device=device)
     clip_model.eval()
+    clip_model.float()  # ensure float32 weights to match float32 inputs
     
     # Build visual prototypes (auto-detects feat_dim if not provided)
     print("Building visual prototypes...")

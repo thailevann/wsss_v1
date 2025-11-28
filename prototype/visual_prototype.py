@@ -94,6 +94,7 @@ def build_visual_prototypes(
 
     clip_model.eval()
     clip_model.to(device)
+    clip_model.float()  # align CLIP weights with float32 image tensors
 
     # Auto-detect feature dimension from CLIP if needed
     if feat_dim is None:
