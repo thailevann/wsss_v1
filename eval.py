@@ -21,6 +21,8 @@ from model.classnet import ClassNetPP
 from model.clip_encoder import encode_image_to_tokens
 from utils import mask_to_class_indices, compute_presence_metrics
 
+IGNORE_LABEL = -1
+
 
 def sinkhorn_norm(A: torch.Tensor, num_iters: int = 5):
     """
@@ -57,6 +59,126 @@ def get_box_mask(cam: torch.Tensor, lambda_thr: float):
     Bc = torch.from_numpy(final_box_mask).flatten().unsqueeze(0).to(cam.device).float()
     
     return Bc
+
+
+def estimate_bg_mask(
+    pil_img: Image.Image,
+    v_thr: int = 240,
+    s_thr: int = 15,
+    min_size: int = 32,
+) -> np.ndarray:
+    """
+    Estimate background (glass) regions using HSV heuristics.
+    Returns boolean mask where True indicates background.
+    """
+    hsv = pil_img.convert("HSV")
+    _, s_channel, v_channel = hsv.split()
+    s = np.array(s_channel, dtype=np.uint8)
+    v = np.array(v_channel, dtype=np.uint8)
+
+    bg_mask = (v > v_thr) & (s < s_thr)
+    tissue_mask = ~bg_mask
+
+    if tissue_mask.any():
+        num_labels, labels = cv2.connectedComponents(tissue_mask.astype(np.uint8))
+        for label in range(1, num_labels):
+            region = labels == label
+            if region.sum() < min_size:
+                tissue_mask[region] = False
+        bg_mask = ~tissue_mask
+
+    return bg_mask.astype(bool)
+
+
+def build_histograms(
+    samples: List[Dict],
+    num_classes: int,
+    bins: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    hist_pos = np.zeros((num_classes, bins), dtype=np.int64)
+    hist_neg = np.zeros((num_classes, bins), dtype=np.int64)
+
+    for sample in samples:
+        score_map = sample["score_np"]
+        gt = sample["gt_np"]
+        tissue_mask = sample["tissue_np"]
+        valid = (gt != IGNORE_LABEL) & tissue_mask
+        if not np.any(valid):
+            continue
+
+        for cid in range(num_classes):
+            s_vals = score_map[cid][valid]
+            if s_vals.size == 0:
+                continue
+            g = (gt[valid] == cid)
+            if not (g.any() or (~g).any()):
+                continue
+            bin_idx = np.clip((s_vals * (bins - 1)).astype(np.int64), 0, bins - 1)
+            np.add.at(hist_pos[cid], bin_idx[g], 1)
+            np.add.at(hist_neg[cid], bin_idx[~g], 1)
+
+    return hist_pos, hist_neg
+
+
+def search_best_thresholds(
+    hist_pos: np.ndarray,
+    hist_neg: np.ndarray,
+    classes: List[str],
+) -> Tuple[np.ndarray, np.ndarray]:
+    num_classes, bins = hist_pos.shape
+    best_thr = np.zeros(num_classes, dtype=np.float32)
+    best_iou = np.zeros(num_classes, dtype=np.float32)
+
+    for cid in range(num_classes):
+        pos = hist_pos[cid]
+        neg = hist_neg[cid]
+        if pos.sum() == 0:
+            best_thr[cid] = 0.5
+            best_iou[cid] = 0.0
+            print(
+                f"[TH-SEARCH] {classes[cid]:<25} insufficient positives. Falling back to 0.5."
+            )
+            continue
+
+        tp = np.cumsum(pos[::-1])[::-1]
+        fp = np.cumsum(neg[::-1])[::-1]
+        fn = pos.sum() - tp
+        denom = tp + fp + fn
+        iou = np.zeros_like(denom, dtype=np.float32)
+        nz = denom > 0
+        iou[nz] = tp[nz].astype(np.float32) / denom[nz].astype(np.float32)
+
+        idx = int(iou.argmax())
+        best_thr[cid] = idx / (bins - 1)
+        best_iou[cid] = iou[idx]
+        print(
+            f"[TH-SEARCH] {classes[cid]:<25} Thr={best_thr[cid]:.3f} "
+            f"IoU={best_iou[cid]*100:.2f}%"
+        )
+
+    return best_thr, best_iou
+
+
+def infer_masks_from_scores(
+    score_map: np.ndarray,
+    thresholds: np.ndarray,
+    seed_scale: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    C, H, W = score_map.shape
+    max_vals = score_map.max(axis=0)
+    argmax = score_map.argmax(axis=0)
+
+    pred_strict = np.full((H, W), IGNORE_LABEL, dtype=np.int16)
+    pred_seed = np.full((H, W), IGNORE_LABEL, dtype=np.int16)
+
+    for cid in range(C):
+        thr = thresholds[cid]
+        mask_strict = (argmax == cid) & (max_vals >= thr)
+        mask_seed = (argmax == cid) & (max_vals >= (seed_scale * thr))
+        pred_strict[mask_strict] = cid
+        pred_seed[mask_seed] = cid
+
+    return pred_strict, pred_seed
 
 
 def caa_refinement(cam_norm: torch.Tensor, patch_feats_norm: torch.Tensor,
@@ -125,6 +247,23 @@ def main():
                        help="Directory to save pseudo masks (optional)")
     parser.add_argument("--no_caa", action="store_true",
                        help="Skip CAA refinement and use raw CAMs")
+    parser.add_argument("--use_bg_refine", action="store_true",
+                       help="Apply Stage 2.2 background gating and probability weighting")
+    parser.add_argument("--use_bg_thresholds", action="store_true",
+                       help="Enable Stage 2.2 per-class threshold search (requires masks)")
+    parser.add_argument("--bg_bins", type=int, default=256,
+                       help="Number of histogram bins for threshold search")
+    parser.add_argument("--bg_seed_scale", type=float, default=0.5,
+                       help="Seed threshold scale relative to strict threshold")
+    parser.add_argument("--bg_v_thr", type=int, default=240,
+                       help="HSV value threshold for background detection")
+    parser.add_argument("--bg_s_thr", type=int, default=15,
+                       help="HSV saturation threshold for background detection")
+    parser.add_argument("--bg_min_size", type=int, default=32,
+                       help="Minimum tissue component size to keep during BG filtering")
+    parser.add_argument("--bg_pred_variant", type=str, default="strict",
+                       choices=["strict", "seed"],
+                       help="Which Stage 2.2 prediction variant to evaluate when thresholds are enabled")
     parser.add_argument("--single_image_path", type=str, default=None,
                        help="Optional single image path for standalone pseudo mask generation")
     parser.add_argument("--single_mask_path", type=str, default=None,
@@ -133,17 +272,6 @@ def main():
                        help="Path to save the single-image visualization (default: data_root/single_pseudo.png)")
     parser.add_argument("--single_show", action="store_true",
                        help="Display the single-image visualization instead of just saving")
-    parser.add_argument("--no_caa", action="store_true",
-                    help="Skip CAA refinement and use raw CAMs")
-
-    # Trong phần xử lý CAM (khoảng dòng 282-285), thay bằng:
-    if args.no_caa:
-        refined_cam_tok = cam_norm_tok  # Dùng CAM gốc, không refine
-    else:
-        refined_cam_tok = caa_refinement(
-            cam_norm_tok, token_feats, 
-            t=args.caa_attn_power, lambda_thr=args.caa_thr
-        )
     args = parser.parse_args()
     
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -215,17 +343,17 @@ def main():
     use_caa = not args.no_caa
     if not use_caa:
         print("[INFO] CAA refinement disabled. Using raw CAMs for pseudo masks.")
-    
-    def infer_pseudo_mask(
-        img_pil: Image.Image,
-        class_filter: Optional[List[str]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Generate pseudo mask and averaged CAM tensor for a single image.
-        Returns (pred_mask, P_resized). Both tensors are on the evaluation device.
-        """
-        class_filter_set = set(class_filter) if class_filter else None
-        refined_cams_per_scale: List[torch.Tensor] = []
+    if args.use_bg_thresholds and not args.use_bg_refine:
+        raise ValueError("--use_bg_thresholds requires --use_bg_refine.")
+    if args.use_bg_refine:
+        print(
+            "[INFO] Stage 2.2 background refinement enabled "
+            f"(threshold search: {'ON' if args.use_bg_thresholds else 'OFF'})."
+        )
+
+    def compute_maps(img_pil: Image.Image) -> Optional[Dict[str, np.ndarray]]:
+        refined_maps: List[torch.Tensor] = []
+        score_maps: List[torch.Tensor] = []
 
         with torch.no_grad():
             for scale in args.scales:
@@ -240,7 +368,9 @@ def main():
                 target_size = pp.shape[-2:]
 
                 toks = encode_image_to_tokens(clip_model, inp)
-                _, act_maps, patch_feats_norm = classnet(toks[:, 1:])
+                logits, act_maps, patch_feats_norm = classnet(toks[:, 1:])
+                logits = logits.squeeze(0)
+                probs = torch.sigmoid(logits)
                 act_maps = act_maps.squeeze(0)
 
                 token_feats = patch_feats_norm.squeeze(0)
@@ -254,11 +384,7 @@ def main():
                 ).squeeze(0)
 
                 refined = torch.zeros_like(cams_hi)
-
-                for ci, c in enumerate(classes_no_bg):
-                    if class_filter_set is not None and c not in class_filter_set:
-                        continue
-
+                for ci in range(NUM_CLASSES):
                     cam = cams_hi[ci]
                     cam_norm = (cam - cam.min()) / (cam.max() + 1e-7)
 
@@ -288,49 +414,77 @@ def main():
 
                     refined[ci] = refined_cam
 
-                refined_cams_per_scale.append(refined)
+                refined = torch.clamp(refined, min=0.0)
+                score = torch.clamp(refined * probs.view(-1, 1, 1), min=0.0, max=1.0)
+                refined_maps.append(refined)
+                score_maps.append(score)
 
-        if not refined_cams_per_scale:
-            return None, None
+        if not refined_maps:
+            return None
 
-        cams_stack = torch.stack(refined_cams_per_scale, dim=0)
-        P = cams_stack.mean(dim=0)
+        refined_avg = torch.stack(refined_maps, dim=0).mean(dim=0)
+        score_avg = torch.stack(score_maps, dim=0).mean(dim=0)
 
-        if P.shape[1:] != (224, 224):
-            P_resized = F.interpolate(
-                P.unsqueeze(0),
-                size=(224, 224),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(0)
-        else:
-            P_resized = P
+        bg_mask_arr = None
+        tissue_arr = np.ones(
+            (refined_avg.shape[-2], refined_avg.shape[-1]), dtype=bool
+        )
+        if args.use_bg_refine:
+            bg_mask_bool = estimate_bg_mask(
+                img_pil, v_thr=args.bg_v_thr, s_thr=args.bg_s_thr, min_size=args.bg_min_size
+            )
+            bg_mask_img = Image.fromarray(bg_mask_bool.astype(np.uint8) * 255)
+            target_h, target_w = refined_avg.shape[-2], refined_avg.shape[-1]
+            bg_mask_resized = (
+                np.array(
+                    bg_mask_img.resize((target_w, target_h), Image.NEAREST)
+                )
+                > 0
+            )
+            bg_mask_tensor = torch.from_numpy(bg_mask_resized).to(
+                device=device, dtype=torch.bool
+            )
+            score_avg[:, bg_mask_tensor] = 0.0
+            refined_avg[:, bg_mask_tensor] = 0.0
+            bg_mask_arr = bg_mask_resized
+            tissue_arr = ~bg_mask_resized
 
-        max_vals, pred_mask = P_resized.max(dim=0)
-        ignore_label = -1
-        pred_mask = torch.where(
+        effective_map = score_avg if args.use_bg_refine else refined_avg
+        max_vals, pred_conf = effective_map.max(dim=0)
+        pred_conf = torch.where(
             max_vals > args.conf_thr,
-            pred_mask,
-            torch.full_like(pred_mask, ignore_label),
+            pred_conf,
+            torch.full_like(pred_conf, IGNORE_LABEL),
         )
 
-        return pred_mask, P_resized
-    
-    # Evaluation
+        if args.use_bg_refine and bg_mask_arr is not None:
+            mask_tensor = torch.from_numpy(bg_mask_arr).to(
+                device=device, dtype=torch.bool
+            )
+            pred_conf = pred_conf.clone()
+            pred_conf[mask_tensor] = IGNORE_LABEL
+
+        return {
+            "refined_np": refined_avg.detach().cpu().numpy().astype(np.float32),
+            "score_np": score_avg.detach().cpu().numpy().astype(np.float32),
+            "pred_conf_np": pred_conf.detach().cpu().numpy().astype(np.int16),
+            "bg_np": bg_mask_arr,
+            "tissue_np": tissue_arr,
+        }
+
     val_images = sorted(glob.glob(os.path.join(val_img_dir, "*.png")))
     print(f"Evaluating on {len(val_images)} test images...")
-    
-    hist = torch.zeros(NUM_CLASSES, NUM_CLASSES, device=device)
-    tp_cls = torch.zeros(NUM_CLASSES, device=device)
-    fp_cls = torch.zeros(NUM_CLASSES, device=device)
-    fn_cls = torch.zeros(NUM_CLASSES, device=device)
-    tn_cls = torch.zeros(NUM_CLASSES, device=device)
-    visual_samples = []
-    pseudo_outputs = []
-    
-    eval_desc = "Evaluating Pseudo Masks (CAA)" if use_caa else "Evaluating Pseudo Masks (No CAA)"
-    for i, img_path in tqdm(list(enumerate(val_images)), total=len(val_images),
-                             desc=eval_desc):
+
+    desc_parts = ["CAA" if use_caa else "No CAA"]
+    if args.use_bg_refine:
+        desc_parts.append("BG refine")
+        if args.use_bg_thresholds:
+            desc_parts.append("Thr search")
+    result_label = " + ".join(desc_parts)
+    eval_desc = f"Evaluating Pseudo Masks ({result_label})"
+
+    samples: List[Dict] = []
+    for _, img_path in tqdm(list(enumerate(val_images)), total=len(val_images), desc=eval_desc):
         mask_path = os.path.join(val_mask_dir, os.path.basename(img_path))
         if not os.path.exists(mask_path):
             continue
@@ -338,64 +492,114 @@ def main():
         try:
             img_pil = Image.open(img_path).convert("RGB")
             mask_pil = Image.open(mask_path)
-
-            mask_indices, present_classes = mask_to_class_indices(mask_pil, classes_no_bg)
-            gt_mask = torch.from_numpy(mask_indices).long().to(device)
-            gt_mask = F.interpolate(
-                gt_mask[None, None].float(),
-                size=(224, 224),
-                mode="nearest"
-            ).squeeze(0).squeeze(0).long()
-
-            gt_labels = torch.zeros(NUM_CLASSES, device=device)
-            for cls in present_classes:
-                gt_labels[classes_no_bg.index(cls)] = 1.0
         except Exception:
             continue
 
-        unique_classes = torch.unique(gt_mask)
-        lbls = [classes_no_bg[c] for c in unique_classes
-                if 0 <= int(c) < NUM_CLASSES]
-        if not lbls:
+        mask_indices, present_classes = mask_to_class_indices(mask_pil, classes_no_bg)
+        gt_mask = torch.from_numpy(mask_indices).long().to(device)
+        gt_mask = F.interpolate(
+            gt_mask[None, None].float(),
+            size=(224, 224),
+            mode="nearest",
+        ).squeeze(0).squeeze(0).long()
+        gt_np = gt_mask.cpu().numpy().astype(np.int16)
+
+        gt_labels_np = np.zeros(NUM_CLASSES, dtype=np.float32)
+        for cls_name in present_classes:
+            if cls_name in classes_no_bg:
+                gt_labels_np[classes_no_bg.index(cls_name)] = 1.0
+
+        maps = compute_maps(img_pil)
+        if maps is None:
             continue
 
-        pred_mask, P_resized = infer_pseudo_mask(img_pil, class_filter=lbls)
-        if pred_mask is None:
-            continue
+        samples.append(
+            {
+                "name": os.path.basename(img_path),
+                "img_rgb": np.array(img_pil.resize((224, 224))),
+                "gt_np": gt_np,
+                "gt_labels_np": gt_labels_np,
+                "score_np": maps["score_np"],
+                "pred_conf_np": maps["pred_conf_np"],
+                "bg_np": maps["bg_np"],
+                "tissue_np": maps["tissue_np"],
+                "pred_seed_np": None,
+                "pred_strict_np": None,
+            }
+        )
 
-        valid = (gt_mask >= 0) & (gt_mask < NUM_CLASSES) & (pred_mask >= 0)
+    if not samples:
+        print("No samples available for evaluation.")
+        return
+
+    best_thr = None
+    if args.use_bg_refine and args.use_bg_thresholds:
+        print("\n[Stage 2.2] Running per-class threshold search...")
+        hist_pos, hist_neg = build_histograms(samples, NUM_CLASSES, args.bg_bins)
+        best_thr, best_iou = search_best_thresholds(hist_pos, hist_neg, classes_no_bg)
+
+    for sample in samples:
+        if best_thr is not None:
+            pred_strict, pred_seed = infer_masks_from_scores(
+                sample["score_np"], best_thr, args.bg_seed_scale
+            )
+            if sample["bg_np"] is not None:
+                pred_strict[sample["bg_np"]] = IGNORE_LABEL
+                pred_seed[sample["bg_np"]] = IGNORE_LABEL
+            sample["pred_strict_np"] = pred_strict
+            sample["pred_seed_np"] = pred_seed
+            sample["pred_final_np"] = (
+                pred_strict if args.bg_pred_variant == "strict" else pred_seed
+            )
+        else:
+            sample["pred_final_np"] = sample["pred_conf_np"]
+
+    hist = torch.zeros(NUM_CLASSES, NUM_CLASSES, device=device)
+    tp_cls = torch.zeros(NUM_CLASSES, device=device)
+    fp_cls = torch.zeros(NUM_CLASSES, device=device)
+    fn_cls = torch.zeros(NUM_CLASSES, device=device)
+    tn_cls = torch.zeros(NUM_CLASSES, device=device)
+    pseudo_outputs = []
+
+    for sample in samples:
+        gt_tensor = torch.from_numpy(sample["gt_np"].astype(np.int64)).to(device)
+        pred_tensor = torch.from_numpy(sample["pred_final_np"].astype(np.int64)).to(device)
+
+        valid = (gt_tensor >= 0) & (gt_tensor < NUM_CLASSES) & (pred_tensor >= 0)
         if valid.sum() == 0:
             continue
 
         hist += torch.bincount(
-            NUM_CLASSES * gt_mask[valid] + pred_mask[valid],
-            minlength=NUM_CLASSES ** 2
+            NUM_CLASSES * gt_tensor[valid] + pred_tensor[valid],
+            minlength=NUM_CLASSES ** 2,
         ).view(NUM_CLASSES, NUM_CLASSES)
 
         pred_labels = torch.zeros(NUM_CLASSES, device=device)
         for ci in range(NUM_CLASSES):
-            if (pred_mask == ci).any():
+            if (pred_tensor == ci).any():
                 pred_labels[ci] = 1.0
 
-        tp_cls += (pred_labels * gt_labels)
-        fp_cls += (pred_labels * (1.0 - gt_labels))
-        fn_cls += ((1.0 - pred_labels) * gt_labels)
-        tn_cls += ((1.0 - pred_labels) * (1.0 - gt_labels))
+        gt_labels_tensor = torch.from_numpy(sample["gt_labels_np"]).to(device)
+        tp_cls += pred_labels * gt_labels_tensor
+        fp_cls += pred_labels * (1.0 - gt_labels_tensor)
+        fn_cls += (1.0 - pred_labels) * gt_labels_tensor
+        tn_cls += (1.0 - pred_labels) * (1.0 - gt_labels_tensor)
 
-        sample = {
-            "img": np.array(img_pil.resize((224, 224))),
-            "pred": pred_mask.cpu().numpy(),
-            "gt": gt_mask.cpu().numpy(),
-            "name": os.path.basename(img_path),
-        }
-        if len(visual_samples) < args.num_visualize:
-            visual_samples.append(sample)
-        pseudo_outputs.append(sample)
+        pseudo_outputs.append(
+            {
+                "img": sample["img_rgb"],
+                "gt": sample["gt_np"],
+                "pred": sample["pred_final_np"],
+                "name": sample["name"],
+                "pred_seed": sample["pred_seed_np"],
+                "pred_strict": sample["pred_strict_np"],
+            }
+        )
 
     # Calculate mIoU
     ious = []
     print("\n" + "=" * 40)
-    print(f"PSEUDO MASK EVALUATION RESULTS ({'CAA' if use_caa else 'No CAA'})")
+    print(f"PSEUDO MASK EVALUATION RESULTS ({result_label})")
     print("=" * 40)
 
     for i, c in enumerate(classes_no_bg):
@@ -455,10 +659,14 @@ def main():
     cmap = mcolors.ListedColormap(['red', 'green', 'blue', 'yellow'])
     norm = mcolors.BoundaryNorm(np.arange(NUM_CLASSES + 1) - 0.5, NUM_CLASSES)
 
-    # Visualize
+    visual_samples = pseudo_outputs[: min(args.num_visualize, len(pseudo_outputs))]
     if visual_samples:
-        fig, axes = plt.subplots(len(visual_samples), 3,
-                                 figsize=(15, 5 * len(visual_samples)))
+        num_cols = 4 if best_thr is not None else 3
+        fig, axes = plt.subplots(
+            len(visual_samples),
+            num_cols,
+            figsize=(5 * num_cols, 5 * len(visual_samples)),
+        )
         if len(visual_samples) == 1:
             axes = axes[None, :]
 
@@ -467,21 +675,36 @@ def main():
             axes[idx, 0].set_title(f"Image: {sample['name']}")
             axes[idx, 0].axis("off")
 
-            axes[idx, 1].imshow(sample["gt"], cmap=cmap, norm=norm,
-                                interpolation="nearest")
+            axes[idx, 1].imshow(sample["gt"], cmap=cmap, norm=norm, interpolation="nearest")
             axes[idx, 1].set_title("Ground Truth")
             axes[idx, 1].axis("off")
 
-            axes[idx, 2].imshow(sample["pred"], cmap=cmap, norm=norm,
-                                interpolation="nearest")
-            axes[idx, 2].set_title("Pseudo Mask Prediction")
-            axes[idx, 2].axis("off")
+            if best_thr is not None:
+                seed_pred = sample["pred_seed"]
+                strict_pred = sample["pred_strict"]
+                if seed_pred is None:
+                    seed_pred = sample["pred"]
+                if strict_pred is None:
+                    strict_pred = sample["pred"]
+
+                axes[idx, 2].imshow(seed_pred, cmap=cmap, norm=norm, interpolation="nearest")
+                axes[idx, 2].set_title("Seed Prediction")
+                axes[idx, 2].axis("off")
+
+                axes[idx, 3].imshow(strict_pred, cmap=cmap, norm=norm, interpolation="nearest")
+                axes[idx, 3].set_title("Strict Prediction")
+                axes[idx, 3].axis("off")
+            else:
+                axes[idx, 2].imshow(sample["pred"], cmap=cmap, norm=norm, interpolation="nearest")
+                axes[idx, 2].set_title("Pseudo Mask Prediction")
+                axes[idx, 2].axis("off")
 
         plt.tight_layout()
-        if use_caa:
-            save_name = f"eval_caaP{args.caa_attn_power}_thr{args.caa_thr}_conf{args.conf_thr}.png"
+        tag = result_label.replace(" ", "").replace("+", "-")
+        if best_thr is not None:
+            save_name = f"eval_{tag}_seed{args.bg_seed_scale:.2f}.png"
         else:
-            save_name = f"eval_noCAA_conf{args.conf_thr}.png"
+            save_name = f"eval_{tag}_conf{args.conf_thr:.2f}.png"
         plt.savefig(os.path.join(args.data_root, save_name))
         print(f"\nVisualization saved to {os.path.join(args.data_root, save_name)}")
 
@@ -499,8 +722,6 @@ def main():
                 single_img_pil = None
 
             gt_np = None
-            class_filter_single: Optional[List[str]] = None
-
             if single_img_pil is not None and args.single_mask_path:
                 mask_path = args.single_mask_path
                 if os.path.exists(mask_path):
@@ -514,37 +735,66 @@ def main():
                             mode="nearest",
                         ).squeeze(0).squeeze(0).long()
                         gt_np = gt_mask.cpu().numpy()
-                        class_filter_single = present_classes
                     except Exception as exc:
                         print(f"[WARNING] Failed to load mask {mask_path}: {exc}")
                 else:
                     print(f"[WARNING] Single mask path not found: {mask_path}")
 
             if single_img_pil is not None:
-                pred_mask_single, _ = infer_pseudo_mask(single_img_pil, class_filter=class_filter_single)
-                if pred_mask_single is None:
+                maps_single = compute_maps(single_img_pil)
+                if maps_single is None:
                     print("[WARNING] Unable to generate pseudo mask for the provided image.")
                 else:
-                    pred_np = pred_mask_single.cpu().numpy()
-                    fig_cols = 3 if gt_np is not None else 2
-                    fig, axes = plt.subplots(1, fig_cols, figsize=(5 * fig_cols, 5))
+                    score_single = maps_single["score_np"]
+                    bg_single = maps_single["bg_np"]
+                    if args.use_bg_refine and args.use_bg_thresholds and best_thr is not None:
+                        single_strict, single_seed = infer_masks_from_scores(
+                            score_single, best_thr, args.bg_seed_scale
+                        )
+                        if bg_single is not None:
+                            single_strict[bg_single] = IGNORE_LABEL
+                            single_seed[bg_single] = IGNORE_LABEL
+                        single_final = (
+                            single_strict if args.bg_pred_variant == "strict" else single_seed
+                        )
+                    else:
+                        single_strict = None
+                        single_seed = None
+                        single_final = maps_single["pred_conf_np"]
+                        if args.use_bg_refine and bg_single is not None:
+                            single_final = single_final.copy()
 
+                    fig_cols = 3 if gt_np is not None else 2
+                    if args.use_bg_refine and args.use_bg_thresholds and best_thr is not None:
+                        fig_cols = fig_cols + 1
+                    fig, axes = plt.subplots(1, fig_cols, figsize=(5 * fig_cols, 5))
                     axes = np.atleast_1d(axes)
+
                     axes[0].imshow(single_img_pil.resize((224, 224)))
                     axes[0].set_title("Input Image")
                     axes[0].axis("off")
 
+                    pred_col = 1
                     if gt_np is not None:
                         axes[1].imshow(gt_np, cmap=cmap, norm=norm, interpolation="nearest")
                         axes[1].set_title("Ground Truth Mask")
                         axes[1].axis("off")
-                        pred_axis = axes[2]
-                    else:
-                        pred_axis = axes[1]
+                        pred_col = 2
 
-                    pred_axis.imshow(pred_np, cmap=cmap, norm=norm, interpolation="nearest")
-                    pred_axis.set_title("Pseudo Mask Prediction")
-                    pred_axis.axis("off")
+                    axes[pred_col].imshow(single_final, cmap=cmap, norm=norm, interpolation="nearest")
+                    axes[pred_col].set_title("Final Prediction")
+                    axes[pred_col].axis("off")
+
+                    if args.use_bg_refine and args.use_bg_thresholds and best_thr is not None:
+                        other_pred = (
+                            single_seed if args.bg_pred_variant == "strict" else single_strict
+                        )
+                        axes[pred_col + 1].imshow(
+                            other_pred, cmap=cmap, norm=norm, interpolation="nearest"
+                        )
+                        label = "Seed Prediction" if args.bg_pred_variant == "strict" else "Strict Prediction"
+                        axes[pred_col + 1].set_title(label)
+                        axes[pred_col + 1].axis("off")
 
                     plt.tight_layout()
 
