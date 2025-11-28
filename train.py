@@ -424,6 +424,8 @@ def main():
                         help="Validation image directory (default: data_root/val/img)")
     parser.add_argument("--val_mask_dir", type=str, default=None,
                         help="Validation mask directory (default: data_root/val/mask)")
+    parser.add_argument("--presence_threshold", type=float, default=0.5,
+                        help="Threshold for converting sigmoid outputs to binary class predictions")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output", type=str, default=None,
                         help="Output checkpoint path (default: data_root/classnet_pp_stage2_1_prograd.pt)")

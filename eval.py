@@ -142,8 +142,18 @@ def main():
     clip_model.float()  # Convert to float32 to match input tensor type
     
     # Load model
-    if not os.path.exists(hybrid_proto_path) or not os.path.exists(checkpoint_path):
-        raise FileNotFoundError("Missing checkpoints for hybrid prototypes / ClassNet++")
+    missing_files = []
+    if not os.path.exists(hybrid_proto_path):
+        missing_files.append(f"Hybrid prototypes: {hybrid_proto_path}")
+    if not os.path.exists(checkpoint_path):
+        missing_files.append(f"Checkpoint: {checkpoint_path}")
+    if missing_files:
+        raise FileNotFoundError(
+            f"Missing required files:\n  " + "\n  ".join(missing_files) +
+            f"\n\nPlease ensure you have:\n"
+            f"  1. Run build_hybrid_prototypes.py to generate hybrid_prototypes.pt\n"
+            f"  2. Run train.py to generate the model checkpoint"
+        )
     
     hybrid_bank = torch.load(hybrid_proto_path, map_location="cpu")
     ckpt = torch.load(checkpoint_path, map_location=device)
