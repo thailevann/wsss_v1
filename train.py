@@ -430,7 +430,7 @@ def main():
         ]),
         classes_no_bg,
         batch_size=args.batch_size,
-        device=device.type,
+        device="cpu",  # keep dataset tensors on CPU; move to GPU during validation step
     )
     if len(val_loader.dataset) == 0:
         print(f"[WARN] No validation samples found in {val_img_dir} / {val_mask_dir}")
