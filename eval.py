@@ -19,6 +19,7 @@ import cv2
 import clip
 from model.classnet import ClassNetPP
 from model.clip_encoder import encode_image_to_tokens
+from utils import mask_to_class_indices, compute_presence_metrics
 
 
 def sinkhorn_norm(A: torch.Tensor, num_iters: int = 5):
@@ -136,6 +137,7 @@ def main():
     print(f"Loading CLIP model: {args.clip_model}")
     clip_model, clip_preprocess = clip.load(args.clip_model, device=device)
     clip_model.eval().to(device)
+    clip_model.float()  # Convert to float32 to match input tensor type
     
     # Load model
     if not os.path.exists(hybrid_proto_path) or not os.path.exists(checkpoint_path):
@@ -174,6 +176,10 @@ def main():
     print(f"Evaluating on {len(val_images)} test images...")
     
     hist = torch.zeros(NUM_CLASSES, NUM_CLASSES, device=device)
+    tp_cls = torch.zeros(NUM_CLASSES, device=device)
+    fp_cls = torch.zeros(NUM_CLASSES, device=device)
+    fn_cls = torch.zeros(NUM_CLASSES, device=device)
+    tn_cls = torch.zeros(NUM_CLASSES, device=device)
     visual_samples = []
     
     for i, img_path in tqdm(list(enumerate(val_images)), total=len(val_images),
@@ -185,10 +191,18 @@ def main():
         try:
             img_pil = Image.open(img_path).convert("RGB")
             mask_pil = Image.open(mask_path)
-            gt_mask = torch.from_numpy(np.array(mask_pil)).long().to(device)
-            gt_mask = F.interpolate(gt_mask[None, None].float(),
-                                    size=(224, 224),
-                                    mode="nearest").squeeze(0).squeeze(0).long()
+
+            mask_indices, present_classes = mask_to_class_indices(mask_pil, classes_no_bg)
+            gt_mask = torch.from_numpy(mask_indices).long().to(device)
+            gt_mask = F.interpolate(
+                gt_mask[None, None].float(),
+                size=(224, 224),
+                mode="nearest"
+            ).squeeze(0).squeeze(0).long()
+
+            gt_labels = torch.zeros(NUM_CLASSES, device=device)
+            for cls in present_classes:
+                gt_labels[classes_no_bg.index(cls)] = 1.0
         except Exception:
             continue
 
@@ -293,6 +307,16 @@ def main():
             minlength=NUM_CLASSES ** 2
         ).view(NUM_CLASSES, NUM_CLASSES)
 
+        pred_labels = torch.zeros(NUM_CLASSES, device=device)
+        for ci in range(NUM_CLASSES):
+            if (pred_mask == ci).any():
+                pred_labels[ci] = 1.0
+
+        tp_cls += (pred_labels * gt_labels)
+        fp_cls += (pred_labels * (1.0 - gt_labels))
+        fn_cls += ((1.0 - pred_labels) * gt_labels)
+        tn_cls += ((1.0 - pred_labels) * (1.0 - gt_labels))
+
         if len(visual_samples) < args.num_visualize:
             visual_samples.append({
                 "img": np.array(img_pil.resize((224, 224))),
@@ -308,15 +332,49 @@ def main():
     print("=" * 40)
 
     for i, c in enumerate(classes_no_bg):
-        tp = hist[i, i]
-        union = hist[i, :].sum() + hist[:, i].sum() - tp
-        iou = (tp / (union + 1e-7)).item()
+        cls_tp = hist[i, i]
+        union = hist[i, :].sum() + hist[:, i].sum() - cls_tp
+        iou = (cls_tp / (union + 1e-7)).item()
         ious.append(iou)
         print(f"Class {c:<25}: {iou * 100:.2f}%")
 
     miou = sum(ious) / len(ious)
     print("-" * 40)
     print(f"MEAN IOU (mIoU)                       : {miou * 100:.2f}%")
+    print("=" * 40)
+
+    presence_metrics = compute_presence_metrics(tp_cls, fp_cls, fn_cls, tn_cls, classes_no_bg)
+    summary = presence_metrics["summary"]
+    print("CLASS PRESENCE METRICS")
+    print("-" * 40)
+    for cls, cls_metrics in presence_metrics["per_class"].items():
+        print(
+            f"{cls:25}: "
+            f"Acc {cls_metrics['accuracy']*100:.2f}% | "
+            f"Prec {cls_metrics['precision']*100:.2f}% | "
+            f"Rec {cls_metrics['recall']*100:.2f}% | "
+            f"F1 {cls_metrics['f1']*100:.2f}% | "
+            f"IoU {cls_metrics['iou']*100:.2f}% | "
+            f"Dice {cls_metrics['dice']*100:.2f}% | "
+            f"bIoU {cls_metrics['biou']*100:.2f}%"
+        )
+    print("-" * 40)
+    print(
+        "Mean Acc {0:.2f}% | Mean Prec {1:.2f}% | Mean Rec {2:.2f}% | Mean F1 {3:.2f}%".format(
+            summary["mean_accuracy"] * 100,
+            summary["mean_precision"] * 100,
+            summary["mean_recall"] * 100,
+            summary["mean_f1"] * 100,
+        )
+    )
+    print(
+        "mIoU {0:.2f}% | FwIoU {1:.2f}% | Mean bIoU {2:.2f}% | Mean Dice {3:.2f}%".format(
+            summary["mIoU"] * 100,
+            summary["FwIoU"] * 100,
+            summary["mean_bIoU"] * 100,
+            summary["mean_dice"] * 100,
+        )
+    )
     print("=" * 40)
 
     # Visualize
@@ -345,8 +403,9 @@ def main():
             axes[idx, 2].axis("off")
 
         plt.tight_layout()
-        plt.savefig(os.path.join(args.data_root, "eval_visualization.png"))
-        print(f"\nVisualization saved to {os.path.join(args.data_root, 'eval_visualization.png')}")
+        save_name = f"eval_caaP{args.caa_attn_power}_thr{args.caa_thr}_conf{args.conf_thr}.png"
+        plt.savefig(os.path.join(args.data_root, save_name))
+        print(f"\nVisualization saved to {os.path.join(args.data_root, save_name)}")
 
 
 if __name__ == "__main__":

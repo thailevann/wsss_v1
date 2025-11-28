@@ -26,6 +26,14 @@ def main():
                        help="Output path (default: data_root/visual_prototypes_clip.pt)")
     parser.add_argument("--feat_dim", type=int, default=None,
                        help="Feature dimension (auto-detected if None)")
+    parser.add_argument("--text_proto_path", type=str, default=None,
+                       help="Path to text prototypes for CAM guidance (default: data_root/text_prototypes_clip.pt)")
+    parser.add_argument("--sim_threshold", type=float, default=0.2,
+                       help="Initial cosine similarity threshold vs. text prototype")
+    parser.add_argument("--refine_threshold", type=float, default=0.35,
+                       help="Refinement cosine threshold vs. coarse visual prototype")
+    parser.add_argument("--cam_topk", type=float, default=0.3,
+                       help="Fraction of top CAM tokens to pool for regional features")
     
     args = parser.parse_args()
     
@@ -49,6 +57,10 @@ def main():
         n_prototypes_per_class=args.n_prototypes,
         batch_size=args.batch_size,
         feat_dim=args.feat_dim,
+        text_proto_path=args.text_proto_path or os.path.join(args.data_root, "text_prototypes_clip.pt"),
+        sim_threshold=args.sim_threshold,
+        refine_threshold=args.refine_threshold,
+        cam_topk=args.cam_topk,
     )
     
     # Save

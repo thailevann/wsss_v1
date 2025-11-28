@@ -18,9 +18,11 @@ from model.clip_encoder import encode_image_to_tokens
 from dataloader import (
     load_training_data,
     create_training_dataloader,
+    create_evaluation_dataloader,
     build_targets,
-    load_batch_images
+    load_batch_images,
 )
+from utils import compute_presence_metrics
 
 
 def proto_contrastive_loss(feat, act, targets, protos, margin=0.2):
@@ -71,40 +73,45 @@ def proto_contrastive_loss(feat, act, targets, protos, margin=0.2):
     return F.relu(margin - (sim_pos - sim_neg)).mean()
 
 
-def validate(model, idx_list, paths, labels, classes, clip_model, clip_preprocess, device, batch_size=32):
-    """Validate model"""
+def validate(model, val_loader, classes, clip_model, device):
+    """Validate model on mask-derived labels."""
     model.eval()
-    correct = torch.zeros(len(classes), device=device)
-    total = 0
+    num_classes = len(classes)
+    tp = torch.zeros(num_classes, device=device)
+    fp = torch.zeros(num_classes, device=device)
+    fn = torch.zeros(num_classes, device=device)
+    tn = torch.zeros(num_classes, device=device)
+    total_samples = 0
 
     with torch.no_grad():
-        for start in range(0, len(idx_list), batch_size):
-            batch = idx_list[start:start+batch_size]
-            if not batch:
+        for batch in val_loader:
+            if len(batch) != 4:
                 continue
 
-            batch_paths = [paths[i] for i in batch]
-            batch_labels = [labels[i] for i in batch]
-            
-            img_t, valid_indices = load_batch_images(batch_paths, clip_preprocess, device)
-            if img_t.shape[0] == 0:
+            imgs, _, label_vecs, _ = batch
+            if imgs.shape[0] == 0:
                 continue
-            
-            # Filter labels to match valid images
-            batch_lbls = [batch_labels[i] for i in valid_indices]
 
-            toks = encode_image_to_tokens(clip_model, img_t)
+            imgs = imgs.to(device)
+            label_vecs = label_vecs.to(device).float()
+
+            toks = encode_image_to_tokens(clip_model, imgs)
             logits, _, _ = model(toks[:, 1:])
 
-            targs = build_targets(batch_lbls, classes, device)
             preds = (torch.sigmoid(logits) > 0.5).float()
 
-            correct += (preds == targs).float().sum(0)
-            total += preds.shape[0]
+            tp += (preds * label_vecs).sum(dim=0)
+            fp += (preds * (1.0 - label_vecs)).sum(dim=0)
+            fn += ((1.0 - preds) * label_vecs).sum(dim=0)
+            tn += ((1.0 - preds) * (1.0 - label_vecs)).sum(dim=0)
+            total_samples += imgs.shape[0]
 
-    if total == 0:
-        return {}
-    return {c: (correct[i]/total).item()*100 for i, c in enumerate(classes)}
+    if total_samples == 0:
+        return None
+
+    metrics = compute_presence_metrics(tp, fp, fn, tn, classes)
+    metrics["summary"]["num_samples"] = total_samples
+    return metrics
 
 
 def main():
@@ -131,6 +138,10 @@ def main():
                        help="Margin for contrastive loss")
     parser.add_argument("--val_split", type=float, default=0.2,
                        help="Validation split ratio")
+    parser.add_argument("--val_img_dir", type=str, default=None,
+                       help="Validation image directory (default: data_root/val/img)")
+    parser.add_argument("--val_mask_dir", type=str, default=None,
+                       help="Validation mask directory (default: data_root/val/mask)")
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed")
     parser.add_argument("--output", type=str, default=None,
@@ -146,6 +157,8 @@ def main():
     device = args.device if torch.cuda.is_available() else "cpu"
     classes_no_bg = ["Tumor", "Stroma", "Lymphocytic infiltrate", "Necrosis"]
     train_dir = args.train_dir or os.path.join(args.data_root, "training")
+    val_img_dir = args.val_img_dir or os.path.join(args.data_root, "val", "img")
+    val_mask_dir = args.val_mask_dir or os.path.join(args.data_root, "val", "mask")
     
     # Load CLIP
     print(f"Loading CLIP model: {args.clip_model}")
@@ -196,6 +209,18 @@ def main():
     )
     
     print(f"Data Split: Train={len(train_indices)} | Val={len(val_indices)}")
+
+    print("Preparing validation dataloader...")
+    val_loader = create_evaluation_dataloader(
+        val_img_dir,
+        val_mask_dir,
+        clip_preprocess,
+        classes_no_bg,
+        batch_size=args.batch_size,
+        device=device
+    )
+    if len(val_loader.dataset) == 0:
+        print(f"[WARN] No validation samples found in {val_img_dir} / {val_mask_dir}")
     
     # Training loop
     for epoch in range(1, args.num_epochs + 1):
@@ -250,12 +275,44 @@ def main():
               f"(Cls: {metrics['cls']/n_batches:.3f} | Proto: {metrics['proto']/n_batches:.3f})")
 
         print("Validating...")
-        val_acc = validate(classnet, val_indices, train_img_paths, train_labels,
-                          classes_no_bg, clip_model, clip_preprocess, device, args.batch_size)
+        val_results = validate(classnet, val_loader, classes_no_bg, clip_model, device)
         print("-" * 40)
-        print(f"MEAN ACC: {sum(val_acc.values())/len(classes_no_bg):.2f}%")
-        for c, acc in val_acc.items():
-            print(f"  >> {c:25}: {acc:.2f}%")
+        if val_results is None:
+            print("No validation samples available for evaluation.")
+        else:
+            summary = val_results["summary"]
+            per_class = val_results["per_class"]
+            print(f"Samples evaluated: {summary.get('num_samples', 0)}")
+            for cls, cls_metrics in per_class.items():
+                print(
+                    f"  >> {cls:25}: "
+                    f"Acc {cls_metrics['accuracy']*100:.2f}% | "
+                    f"Prec {cls_metrics['precision']*100:.2f}% | "
+                    f"Rec {cls_metrics['recall']*100:.2f}% | "
+                    f"F1 {cls_metrics['f1']*100:.2f}% | "
+                    f"IoU {cls_metrics['iou']*100:.2f}% | "
+                    f"Dice {cls_metrics['dice']*100:.2f}% | "
+                    f"bIoU {cls_metrics['biou']*100:.2f}%"
+                )
+            print("-" * 40)
+            print(
+                "Mean Acc {0:.2f}% | Mean Prec {1:.2f}% | Mean Rec {2:.2f}% | "
+                "Mean F1 {3:.2f}%".format(
+                    summary["mean_accuracy"] * 100,
+                    summary["mean_precision"] * 100,
+                    summary["mean_recall"] * 100,
+                    summary["mean_f1"] * 100,
+                )
+            )
+            print(
+                "mIoU {0:.2f}% | FwIoU {1:.2f}% | "
+                "Mean bIoU {2:.2f}% | Mean Dice {3:.2f}%".format(
+                    summary["mIoU"] * 100,
+                    summary["FwIoU"] * 100,
+                    summary["mean_bIoU"] * 100,
+                    summary["mean_dice"] * 100,
+                )
+            )
         print("-" * 40)
     
     # Save checkpoint

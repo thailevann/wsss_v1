@@ -5,13 +5,16 @@ import os
 import glob
 import random
 from typing import List, Tuple, Optional, Dict
-import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import torch.nn.functional as F
 
-from utils import parse_labels_from_filename, list_training_images
+from utils import (
+    parse_labels_from_filename,
+    list_training_images,
+    mask_to_class_indices,
+)
 
 
 class TrainingDataset(Dataset):
@@ -117,20 +120,26 @@ class EvaluationDataset(Dataset):
             # Preprocess image
             img_tensor = self.clip_preprocess(img_pil)
             
-            # Load and resize mask
-            gt_mask = torch.from_numpy(np.array(mask_pil)).long().to(self.device)
+            # Convert mask to class indices and compute presence vector
+            mask_indices, present_classes = mask_to_class_indices(mask_pil, self.classes)
+            gt_mask = torch.from_numpy(mask_indices).long().to(self.device)
             gt_mask = F.interpolate(
                 gt_mask[None, None].float(),
                 size=(224, 224),
                 mode="nearest"
             ).squeeze(0).squeeze(0).long()
+
+            label_vec = torch.zeros(len(self.classes), dtype=torch.float32, device=self.device)
+            for cls in present_classes:
+                label_vec[self.classes.index(cls)] = 1.0
             
-            return img_tensor, gt_mask, img_path
+            return img_tensor, gt_mask, label_vec, img_path
         except Exception as e:
             # Return dummy data if loading fails
             img_tensor = torch.zeros(3, 224, 224)
-            gt_mask = torch.zeros(224, 224, dtype=torch.long, device=self.device)
-            return img_tensor, gt_mask, img_path
+            gt_mask = torch.full((224, 224), fill_value=-1, dtype=torch.long, device=self.device)
+            label_vec = torch.zeros(len(self.classes), dtype=torch.float32, device=self.device)
+            return img_tensor, gt_mask, label_vec, img_path
 
 
 def build_targets(lbls: List[List[str]], classes: List[str], device: str) -> torch.Tensor:
