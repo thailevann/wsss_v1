@@ -26,18 +26,14 @@ def main():
                        help="Output path (default: data_root/visual_prototypes_clip.pt)")
     parser.add_argument("--feat_dim", type=int, default=None,
                        help="Feature dimension (auto-detected if None)")
-    parser.add_argument("--text_proto_path", type=str, default=None,
-                       help="Path to text prototypes for CAM guidance (default: data_root/text_prototypes_clip.pt)")
-    parser.add_argument("--sim_threshold", type=float, default=0.2,
-                       help="Initial cosine similarity threshold vs. text prototype")
-    parser.add_argument("--refine_threshold", type=float, default=0.35,
-                       help="Refinement cosine threshold vs. coarse visual prototype")
-    parser.add_argument("--cam_topk", type=float, default=0.3,
-                       help="Fraction of top CAM tokens to pool for regional features")
+    parser.add_argument("--max_feats_per_class", type=int, default=20000,
+                       help="Maximum features retained per class before clustering")
+    parser.add_argument("--bg_class", type=str, default="Background",
+                       help="Background class name")
     
     args = parser.parse_args()
     
-    classes = ["Tumor", "Stroma", "Lymphocytic infiltrate", "Necrosis", "Background"]
+    classes = ["Tumor", "Stroma", "Lymphocytic infiltrate", "Necrosis", args.bg_class]
     train_dir = args.train_dir or os.path.join(args.data_root, "training")
     
     # Load CLIP
@@ -58,10 +54,8 @@ def main():
         n_prototypes_per_class=args.n_prototypes,
         batch_size=args.batch_size,
         feat_dim=args.feat_dim,
-        text_proto_path=args.text_proto_path or os.path.join(args.data_root, "text_prototypes_clip.pt"),
-        sim_threshold=args.sim_threshold,
-        refine_threshold=args.refine_threshold,
-        cam_topk=args.cam_topk,
+        max_feats_per_class=args.max_feats_per_class,
+        bg_class=args.bg_class,
     )
     
     # Save
@@ -70,9 +64,11 @@ def main():
     torch.save(visual_proto_bank, output_path)
     
     print(f"\nSaved visual prototype bank to: {output_path}")
-    print(f"Feature dimension: {visual_proto_bank['metadata']['feat_dim']}")
+    print(f"Feature dimension: {visual_proto_bank['metadata']['feature_dim']}")
     for c, proto in visual_proto_bank["visual_prototypes"].items():
         print(f"  {c:24s}: {tuple(proto.shape)}")
+    if visual_proto_bank.get("background_prototypes") is not None:
+        print(f"  {args.bg_class:24s}: {tuple(visual_proto_bank['background_prototypes'].shape)}")
 
 
 if __name__ == "__main__":

@@ -26,28 +26,59 @@ def main():
     
     class2prompts = {
         "Tumor": [
-            "irregular glands", "hyperchromatic nuclei", "nuclear crowding", "atypical epithelial cells",
-            "pleomorphic tumor epithelium", "high nuclear to cytoplasmic ratio", "invasive epithelial nests",
-            "mitotic figures", "abnormal gland formation", "dense tumor clusters"
+            "irregular glands",
+            "hyperchromatic nuclei",
+            "nuclear crowding",
+            "atypical epithelial cells",
+            "pleomorphic tumor epithelium",
+            "high nuclear to cytoplasmic ratio",
+            "invasive epithelial nests",
+            "mitotic figures",
+            "abnormal gland formation",
+            "dense tumor clusters",
         ],
         "Stroma": [
-            "fibroblast connective tissue", "collagen bundles", "spindle-shaped fibroblasts",
-            "eosinophilic fibrous matrix", "myofibroblast stroma", "dense desmoplastic tissue",
-            "fibrotic connective region", "reactive fibrous tissue", "stromal hypercellularity", "fibrous connective tissue"
+            "fibroblast connective tissue",
+            "collagen bundles",
+            "spindle-shaped fibroblasts",
+            "eosinophilic fibrous matrix",
+            "myofibroblast stroma",
+            "dense desmoplastic tissue",
+            "fibrotic connective region",
+            "reactive fibrous tissue",
+            "stromal hypercellularity",
+            "fibrous connective tissue",
         ],
         "Lymphocytic infiltrate": [
-            "small round lymphocytes", "dense lymphoid infiltrate", "monomorphic small cells",
-            "immune cell cluster", "band-like lymphocytic infiltration", "basophilic nuclei",
-            "peritumoral lymphoid cells", "chronic inflammatory infiltrate", "lymphoid aggregate", "round basophilic nuclei"
+            "small round lymphocytes",
+            "dense lymphoid infiltrate",
+            "monomorphic small cells",
+            "immune cell cluster",
+            "band-like lymphocytic infiltration",
+            "basophilic nuclei",
+            "peritumoral lymphoid cells",
+            "chronic inflammatory infiltrate",
+            "lymphoid aggregate",
+            "round basophilic nuclei",
         ],
         "Necrosis": [
-            "acellular eosinophilic debris", "ghost cells without nuclei", "coagulative necrosis region",
-            "granular necrotic material", "cellular remnants", "pale anuclear area",
-            "necrotic focus", "amorphous eosinophilic debris", "dead tissue region", "acellular necrotic zone"
+            "acellular eosinophilic debris",
+            "ghost cells without nuclei",
+            "coagulative necrosis region",
+            "granular necrotic material",
+            "cellular remnants with faded nuclei",
+            "pale anuclear area",
+            "necrotic focus with karyorrhexis",
+            "amorphous eosinophilic debris",
+            "dead tissue region",
+            "acellular necrotic zone",
         ],
         "Background": [
-            "blank slide region without tissue", "white empty background area",
-            "unstained glass slide region", "non-tissue area outside the specimen"
+            "blank slide region without tissue",
+            "white empty background area",
+            "unstained glass slide region",
+            "non-tissue area outside the specimen",
+            "artifact region with no cellular structures",
         ],
     }
     
@@ -64,6 +95,9 @@ def main():
         class2prompts=class2prompts,
         model=clip_model,
         device=device,
+        classes_fg=classes[:4],
+        bg_class="Background",
+        noise_classes=["Necrosis", "Background"],
     )
     
     # Save
@@ -72,13 +106,15 @@ def main():
     torch.save(text_proto_bank, output_path)
     
     print(f"\nSaved text prototype bank to: {output_path}")
-    print(f"Feature dimension: {text_proto_bank['feat_dim']}")
+    feat_dim = text_proto_bank.get("feat_dim")
+    if feat_dim:
+        print(f"Feature dimension: {feat_dim}")
     for c in classes:
         feat = text_proto_bank["class_text_prototypes"][c]
         if feat.dim() == 1:
             print(f"  {c:24s} prototype dim = {feat.shape[0]}")
-        elif feat.dim() == 2:
-            print(f"  {c:24s} prototype dim = {feat.shape}")
+        else:
+            print(f"  {c:24s} prototype shape = {tuple(feat.shape)}")
 
 
 if __name__ == "__main__":

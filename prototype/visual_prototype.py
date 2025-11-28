@@ -1,53 +1,42 @@
 """
-Visual prototype building
+Visual prototype building (Stage 1.1 parity).
 """
 import os
-from typing import Dict, List, Tuple
 from collections import defaultdict
+from typing import Dict, List, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
 from PIL import Image
-from tqdm import tqdm
 from sklearn.cluster import MiniBatchKMeans
+from tqdm import tqdm
 
-from model.clip_encoder import encode_image_to_tokens
-from utils import parse_labels_from_filename, list_training_images
+from utils import list_training_images, parse_labels_from_filename
 
 
-def _prepare_text_prototypes(
-    text_proto_path: str,
-    classes: List[str],
-    device: str,
-) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], int]:
-    if not os.path.exists(text_proto_path):
-        raise FileNotFoundError(f"Text prototype file not found at {text_proto_path}")
+# Thresholds for detecting clean background patches (glass)
+BG_PIXEL_INTENSITY_THR = 225
+BG_AREA_RATIO_THR = 0.70
+BG_SATURATION_THR = 20
 
-    bank = torch.load(text_proto_path, map_location="cpu")
-    per_prompt_bank: Dict[str, torch.Tensor] = bank["per_prompt_text_features"]
 
-    mean_text_vecs: Dict[str, torch.Tensor] = {}
-    prompt_text_vecs: Dict[str, torch.Tensor] = {}
+def _is_visual_background(pil_img: Image.Image) -> bool:
+    """
+    Detect clean background (glass) patches using HSV heuristics.
+    """
+    try:
+        img_hsv = pil_img.convert("HSV")
+        _, s, v = img_hsv.split()
+        np_v = np.array(v, dtype=np.uint8)
+        np_s = np.array(s, dtype=np.uint8)
 
-    for c in classes:
-        if c == "Background":
-            continue
-        if c not in per_prompt_bank:
-            raise KeyError(f"Class '{c}' missing in text prototype bank.")
-
-        feats = per_prompt_bank[c].float()
-        if feats.ndim == 1:
-            feats = feats.unsqueeze(0)
-        feats = F.normalize(feats, p=2, dim=-1)
-
-        prompt_text_vecs[c] = feats.to(device)
-        mean_text_vecs[c] = F.normalize(feats.mean(dim=0), p=2, dim=-1).to(device)
-
-    any_cls = next(iter(prompt_text_vecs))
-    feat_dim = int(prompt_text_vecs[any_cls].shape[-1])
-
-    return mean_text_vecs, prompt_text_vecs, feat_dim
+        is_white = (np_v > BG_PIXEL_INTENSITY_THR) & (np_s < BG_SATURATION_THR)
+        white_ratio = float(is_white.mean())
+        return white_ratio > BG_AREA_RATIO_THR
+    except Exception:
+        gray = np.array(pil_img.convert("L"), dtype=np.uint8)
+        return float((gray > BG_PIXEL_INTENSITY_THR).mean()) > BG_AREA_RATIO_THR
 
 
 def build_visual_prototypes(
@@ -59,261 +48,194 @@ def build_visual_prototypes(
     n_prototypes_per_class: int = 16,
     batch_size: int = 64,
     feat_dim: int = None,
-    text_proto_path: str = None,
-    sim_threshold: float = 0.2,
-    refine_threshold: float = 0.35,
-    cam_topk: float = 0.3,
+    max_feats_per_class: int = 20_000,
+    bg_class: str = "Background",
 ):
     """
-    Build visual prototypes from training images using CAM-guided regional pooling.
+    Build visual prototypes by extracting global CLIP features per patch
+    and clustering (Stage 1.1 logic).
 
     Args:
-        train_dir: Directory containing training images.
-        clip_model: CLIP model.
-        clip_preprocess: CLIP preprocessing function.
-        classes: List of class names (including Background).
-        device: Device to run on.
-        n_prototypes_per_class: Target number of prototypes per class.
+        train_dir: Directory containing training patches.
+        clip_model: Frozen CLIP model.
+        clip_preprocess: CLIP preprocessing pipeline.
+        classes: List of classes (FG + Background).
+        device: Device for feature extraction.
+        n_prototypes_per_class: Target #prototypes per class.
         batch_size: Batch size for feature extraction.
-        feat_dim: Feature dimension (auto-detected if None).
-        text_proto_path: Path to text prototypes for CAM guidance.
-        sim_threshold: Global cosine similarity threshold vs. text prototype.
-        refine_threshold: Cosine similarity threshold vs. coarse prototype.
-        cam_topk: Fraction of top-CAM tokens to pool.
+        feat_dim: Optional feature dimension override.
+        max_feats_per_class: Cap on features per class before clustering.
+        bg_class: Background class name.
 
     Returns:
-        Dictionary with visual prototypes and metadata.
+        Dictionary containing visual prototypes, counts and metadata.
     """
-    if text_proto_path is None:
-        raise ValueError("text_proto_path must be provided for CAM-guided pooling.")
-
-    sim_threshold = float(sim_threshold)
-    refine_threshold = float(refine_threshold)
-    cam_topk = float(cam_topk)
-    cam_topk = min(max(cam_topk, 1e-3), 1.0)
-
     clip_model.eval()
-    clip_model.to(device)
-    clip_model.float()  # align CLIP weights with float32 image tensors
+    clip_model.to(device).float()
 
-    # Auto-detect feature dimension from CLIP if needed
     if feat_dim is None:
         if hasattr(clip_model, "visual") and hasattr(clip_model.visual, "output_dim"):
             feat_dim = int(clip_model.visual.output_dim)
         else:
-            test_img = Image.new("RGB", (224, 224))
-            test_tensor = clip_preprocess(test_img).unsqueeze(0).to(device)
+            test_tensor = clip_preprocess(Image.new("RGB", (224, 224))).unsqueeze(0).to(device)
             with torch.no_grad():
-                test_feat = clip_model.encode_image(test_tensor)
-                feat_dim = int(test_feat.shape[-1])
+                feat_dim = int(clip_model.encode_image(test_tensor).shape[-1])
 
-    text_mean_vecs, text_prompt_vecs, text_feat_dim = _prepare_text_prototypes(
-        text_proto_path, classes, device
-    )
-    if feat_dim != text_feat_dim:
-        raise ValueError(
-            f"Feature dimension mismatch between CLIP ({feat_dim}) and text prototypes ({text_feat_dim})."
-        )
+    classes_fg = [c for c in classes if c != bg_class]
+    classes_all_visual = classes_fg + [bg_class]
 
     print(f"Using feature dimension: {feat_dim}")
 
-    # List training images
     all_img_paths = list_training_images(train_dir)
     print(f"Found {len(all_img_paths)} training images in {train_dir}")
 
-    img_labels: List[List[str]] = []
-    for p in all_img_paths:
-        cls_list = parse_labels_from_filename(p)
-        img_labels.append(cls_list)
+    features_pure: Dict[str, List[torch.Tensor]] = {c: [] for c in classes_all_visual}
+    features_mixed: Dict[str, List[torch.Tensor]] = {c: [] for c in classes_fg}
 
-    class_img_count = defaultdict(int)
-    for cls_list in img_labels:
-        for c in cls_list:
-            class_img_count[c] += 1
-
-    print("Training image counts per class (multi-label counts):")
-    for c in classes:
-        if c == "Background":
-            continue
-        print(f"  {c:24s}: {class_img_count.get(c, 0)}")
-
-    candidate_features: Dict[str, List[torch.Tensor]] = {
-        c: [] for c in classes if c != "Background"
-    }
-    candidate_stats = {c: {"candidates": 0, "retained": 0} for c in candidate_features}
+    counts = defaultdict(int)
+    num_skipped_other = 0
 
     with torch.no_grad():
-        for i in tqdm(
-            range(0, len(all_img_paths), batch_size),
-            desc="Extracting CLIP regional features",
-        ):
-            batch_paths = all_img_paths[i : i + batch_size]
-            batch_labels = img_labels[i : i + batch_size]
+        for start in tqdm(range(0, len(all_img_paths), batch_size), desc="Extracting & Sorting Features"):
+            batch_paths = all_img_paths[start:start + batch_size]
 
-            images = []
-            valid_idx = []
-            for j, (path, _) in enumerate(zip(batch_paths, batch_labels)):
+            pil_imgs: List[Image.Image] = []
+            tensors: List[torch.Tensor] = []
+            valid_idx: List[int] = []
+
+            for idx, path in enumerate(batch_paths):
                 try:
-                    img = Image.open(path).convert("RGB")
-                except Exception as e:
-                    print(f"[WARN] Cannot open image {path}: {e}")
+                    pil_img = Image.open(path).convert("RGB")
+                except Exception as exc:
+                    print(f"[WARN] Cannot open {path}: {exc}")
                     continue
-                images.append(clip_preprocess(img))
-                valid_idx.append(j)
+                pil_imgs.append(pil_img)
+                tensors.append(clip_preprocess(pil_img))
+                valid_idx.append(idx)
 
-            if not images:
+            if not tensors:
                 continue
 
-            images_tensor = torch.stack(images).to(device)
-            image_features = clip_model.encode_image(images_tensor)
-            if image_features.shape[-1] != feat_dim:
-                raise ValueError(
-                    f"Feature dimension mismatch: expected {feat_dim}, "
-                    f"got {image_features.shape[-1]}"
-                )
-            image_features = F.normalize(image_features, p=2, dim=-1)
+            batch_tensor = torch.stack(tensors).to(device)
+            feats = clip_model.encode_image(batch_tensor)
+            feats = F.normalize(feats, p=2, dim=-1).cpu()
 
-            tokens = encode_image_to_tokens(clip_model, images_tensor, project=True)
-            patch_feats = tokens[:, 1:, :]  # drop CLS token
-            if patch_feats.shape[-1] != feat_dim:
-                raise ValueError(
-                    f"Patch feature dimension mismatch: expected {feat_dim}, "
-                    f"got {patch_feats.shape[-1]}"
-                )
-            patch_feats = F.normalize(patch_feats, p=2, dim=-1)
+            for local_idx, src_idx in enumerate(valid_idx):
+                feat_vec = feats[local_idx]
+                pil_img = pil_imgs[local_idx]
+                path = batch_paths[src_idx]
 
-            num_tokens = patch_feats.shape[1]
-            sqrt_tokens = int(num_tokens ** 0.5)
-            if sqrt_tokens * sqrt_tokens != num_tokens:
-                raise ValueError(
-                    f"Unexpected number of tokens ({num_tokens}); cannot reshape to square grid."
-                )
-
-            for j, idx_in_batch in enumerate(valid_idx):
-                lbls = batch_labels[idx_in_batch]
-                if not lbls:
+                if _is_visual_background(pil_img):
+                    features_pure[bg_class].append(feat_vec)
+                    counts[bg_class] += 1
                     continue
 
-                for c in lbls:
-                    if c == "Background" or c not in candidate_features:
-                        continue
+                labels = parse_labels_from_filename(path)
+                fg_labels = [c for c in labels if c in classes_fg]
 
-                    global_sim = torch.dot(image_features[j], text_mean_vecs[c])
-                    if global_sim.item() < sim_threshold:
-                        continue
+                if len(fg_labels) == 1:
+                    cls = fg_labels[0]
+                    features_pure[cls].append(feat_vec)
+                    counts[cls] += 1
+                elif len(fg_labels) > 1:
+                    for cls in fg_labels:
+                        features_mixed[cls].append(feat_vec)
+                        counts[f"{cls}_mixed"] += 1
+                else:
+                    num_skipped_other += 1
 
-                    prompt_vecs = text_prompt_vecs[c]
-                    sim_prompt = patch_feats[j] @ prompt_vecs.t()  # [N, K]
-                    sim_vals, _ = sim_prompt.max(dim=1)
+    print("\n[Stage 1.1] Extraction Summary:")
+    print(f"  >> BACKGROUND (pure glass) patches: {counts[bg_class]}")
+    print(f"  >> OTHER unlabeled non-BG patches skipped: {num_skipped_other}")
+    for cls in classes_fg:
+        pure_n = counts[cls]
+        mixed_n = counts[f"{cls}_mixed"]
+        print(f"  >> {cls:22s}: Pure={pure_n:5d} | Mixed={mixed_n:5d}")
 
-                    k = max(1, int(cam_topk * sim_vals.numel()))
-                    topk_vals, topk_idx = sim_vals.topk(k, sorted=False)
-                    mask = torch.zeros_like(sim_vals, dtype=torch.bool)
-                    mask[topk_idx] = True
+    visual_prototypes: Dict[str, torch.Tensor] = {}
+    prototype_meta: Dict[str, Dict] = {}
 
-                    selected_feats = patch_feats[j][mask]
-                    if selected_feats.numel() == 0:
-                        continue
+    def _cluster_feats(feats_tensor: torch.Tensor, class_name: str) -> torch.Tensor:
+        if feats_tensor.shape[0] > max_feats_per_class:
+            perm = torch.randperm(feats_tensor.shape[0])[:max_feats_per_class]
+            feats_tensor = feats_tensor[perm]
 
-                    weights = topk_vals.unsqueeze(1)
-                    agg_feat = (selected_feats * weights).sum(dim=0) / (
-                        weights.sum(dim=0) + 1e-6
-                    )
-                    agg_feat = F.normalize(agg_feat, p=2, dim=-1)
-
-                    candidate_features[c].append(agg_feat.cpu())
-                    candidate_stats[c]["candidates"] += 1
-
-    features_per_class: Dict[str, torch.Tensor] = {}
-
-    print("\nCoarse prototype refinement:")
-    for c, feats in candidate_features.items():
-        if not feats:
-            features_per_class[c] = torch.empty(0, feat_dim)
-            print(f"  {c:24s}: 0 candidates -> 0 retained")
-            continue
-
-        stack = torch.stack(feats, dim=0)
-        coarse = F.normalize(stack.mean(dim=0, keepdim=True), p=2, dim=-1).squeeze(0)
-
-        refined_feats = []
-        for feat in feats:
-            sim = torch.dot(feat, coarse).item()
-            if sim >= refine_threshold:
-                refined_feats.append(feat)
-
-        if not refined_feats:
-            refined_feats = feats  # fallback
-
-        features_per_class[c] = torch.stack(refined_feats, dim=0)
-        candidate_stats[c]["retained"] = len(refined_feats)
-        print(
-            f"  {c:24s}: {len(feats)} candidates -> {len(refined_feats)} retained "
-            f"(refine thr={refine_threshold:.2f})"
-        )
-
-    print("\nPer-class feature shapes:")
-    for c, tensor in features_per_class.items():
-        print(f"  {c:24s}: {tuple(tensor.shape)}")
-
-    # Cluster to get visual prototypes
-    visual_prototypes = {}
-    prototype_meta = {}
-
-    for c, feats in features_per_class.items():
-        if feats.shape[0] == 0:
-            print(f"[WARN] No features for class {c}, skipping prototype generation.")
-            continue
-
-        n_clusters = min(n_prototypes_per_class, feats.shape[0])
-        print(
-            f"\nRunning MiniBatchKMeans for class '{c}' with {feats.shape[0]} samples, "
-            f"{n_clusters} clusters..."
-        )
-
-        X = feats.numpy().astype(np.float32)
+        num_samples = feats_tensor.shape[0]
+        n_clusters = min(n_prototypes_per_class, num_samples)
+        print(f"  Computing Prototypes for '{class_name}' | Samples: {num_samples} -> K={n_clusters}")
 
         kmeans = MiniBatchKMeans(
             n_clusters=n_clusters,
             batch_size=1024,
-            max_iter=100,
             random_state=42,
-            verbose=0,
-            n_init=3,
+            n_init="auto",
         )
-        kmeans.fit(X)
+        kmeans.fit(feats_tensor.numpy().astype(np.float32))
 
         centers = torch.from_numpy(kmeans.cluster_centers_)
         centers = F.normalize(centers, p=2, dim=-1)
+        return centers
 
-        visual_prototypes[c] = centers
-        prototype_meta[c] = {
-            "n_samples": int(feats.shape[0]),
-            "n_clusters": int(n_clusters),
+    for cls in classes_all_visual:
+        pure_feats = features_pure.get(cls, [])
+        mixed_feats = features_mixed.get(cls, [])
+
+        tensors = []
+        src_type = "none"
+
+        if pure_feats:
+            pure_tensor = torch.stack(pure_feats, dim=0)
+            tensors.append(pure_tensor)
+            src_type = "pure_only"
+
+        if tensors and mixed_feats:
+            tensors.append(torch.stack(mixed_feats, dim=0))
+            src_type = "pure+mixed"
+        elif not tensors and mixed_feats:
+            tensors.append(torch.stack(mixed_feats, dim=0))
+            src_type = "mixed_only"
+
+        if not tensors:
+            print(f"[WARN] Class '{cls}': no features gathered; skipping.")
+            continue
+
+        feats_tensor = torch.cat(tensors, dim=0)
+        centers = _cluster_feats(feats_tensor, cls)
+
+        visual_prototypes[cls] = centers
+        prototype_meta[cls] = {
+            "n_samples": int(feats_tensor.shape[0]),
+            "source": src_type,
         }
 
-    print("\nVisual prototype shapes:")
-    for c, proto in visual_prototypes.items():
-        print(
-            f"  {c:24s}: {tuple(proto.shape)} "
-            f"(n_samples={prototype_meta[c]['n_samples']})"
-        )
+    fg_prototypes = {
+        cls: visual_prototypes[cls]
+        for cls in classes_fg
+        if cls in visual_prototypes
+    }
+    bg_prototypes = visual_prototypes.get(bg_class)
 
-    return {
-        "classes": [c for c in classes if c != "Background"],
-        "visual_prototypes": visual_prototypes,
-        "features_per_class_counts": {
-            c: int(features_per_class[c].shape[0]) for c in features_per_class
+    metadata = {
+        "clip_model": getattr(clip_model, "name", "CLIP"),
+        "feature_dim": feat_dim,
+        "bg_class": bg_class,
+        "thresholds": {
+            "pixel_intensity": BG_PIXEL_INTENSITY_THR,
+            "area_ratio": BG_AREA_RATIO_THR,
+            "saturation": BG_SATURATION_THR,
         },
-        "metadata": {
-            "model_name": "CLIP",
-            "n_prototypes_per_class_target": n_prototypes_per_class,
-            "prototype_meta": prototype_meta,
-            "feat_dim": feat_dim,
-            "sim_threshold": sim_threshold,
-            "refine_threshold": refine_threshold,
-            "cam_topk": cam_topk,
-        },
-        "filter_stats": candidate_stats,
+        "num_skipped_other": num_skipped_other,
+        "prototype_meta": prototype_meta,
     }
 
+    features_counts = dict(counts)
+
+    return {
+        "classes": classes_fg,
+        "bg_class": bg_class,
+        "classes_all_visual": classes_all_visual,
+        "visual_prototypes": fg_prototypes,
+        "background_prototypes": bg_prototypes,
+        "features_per_class_counts": features_counts,
+        "metadata": metadata,
+    }
