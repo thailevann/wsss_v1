@@ -21,7 +21,7 @@ import clip
 from model.classnet import ClassNetPP
 from model.clip_encoder import encode_image_to_tokens
 from dataloader import load_training_data, create_evaluation_dataloader, build_targets
-from utils import compute_presence_metrics, CLASS_COLOR_MAP, BACKGROUND_COLOR
+from utils import compute_presence_metrics, compute_segmentation_iou_batch, _compute_iou_from_counts, CLASS_COLOR_MAP, BACKGROUND_COLOR
 
 
 # -----------------------------------------------------------------------------
@@ -114,6 +114,70 @@ def visualize_val_samples(
             ax.axis("off")
 
         out_path = os.path.join(output_dir, f"epoch{epoch:02d}_idx{local_idx:02d}.png")
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+
+        saved_paths.append(out_path)
+
+    return saved_paths
+
+
+# -----------------------------------------------------------------------------
+# Custom pseudo-mask visualization for arbitrary image paths
+# -----------------------------------------------------------------------------
+@torch.no_grad()
+def visualize_custom_images(
+    model: ClassNetPP,
+    clip_model,
+    image_paths: List[str],
+    classes: List[str],
+    device: torch.device,
+    threshold: float,
+    epoch: int,
+    output_dir: str,
+    preprocess,
+    max_samples: int = 5,
+) -> List[str]:
+    """
+    Generate pseudo masks for user-provided image paths.
+    """
+    if not image_paths:
+        return []
+
+    os.makedirs(output_dir, exist_ok=True)
+    saved_paths: List[str] = []
+    model.eval()
+
+    for idx, img_path in enumerate(image_paths[:max_samples]):
+        try:
+            img = Image.open(img_path).convert("RGB")
+        except Exception as exc:
+            print(f"[Viz] Skipping {img_path}: {exc}")
+            continue
+
+        img_tensor = preprocess(img).unsqueeze(0).to(device)
+        try:
+            tokens = encode_image_to_tokens(clip_model, img_tensor)
+            logits, act_maps, _ = model(tokens[:, 1:])
+        except Exception as exc:
+            print(f"[Viz] Failed to run model on {img_path}: {exc}")
+            continue
+
+        pseudo_idx = _create_pseudo_mask(act_maps, logits, threshold)
+        pseudo_np = pseudo_idx.cpu().numpy()
+        pseudo_rgb = _colorize_index_mask(pseudo_np, classes)
+
+        fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+        axes[0].imshow(img.resize((224, 224)))
+        axes[0].set_title("Image")
+        axes[0].axis("off")
+
+        axes[1].imshow(pseudo_rgb)
+        axes[1].set_title("Pseudo Mask")
+        axes[1].axis("off")
+
+        out_path = os.path.join(output_dir, f"epoch{epoch:02d}_custom{idx:02d}.png")
         fig.tight_layout()
         fig.savefig(out_path, dpi=150)
         plt.close(fig)
@@ -343,13 +407,29 @@ def compute_split_val_accuracy(
 
 
 def validate(model, val_loader, classes, clip_model, device, threshold: float):
-    """Validate model on mask-derived labels."""
+    """
+    Validate model on mask-derived labels with correct IoU calculation.
+    
+    FIXED: Uses the same IoU calculation logic as eval.py:
+    - Only considers pixels where GT is valid (>= 0 and < num_classes)
+    - Properly counts False Negatives (GT has class but pred is IGNORE_LABEL)
+    - Calculates TP, FP, FN correctly for each class
+    """
     model.eval()
     num_classes = len(classes)
-    tp = torch.zeros(num_classes, device=device)
-    fp = torch.zeros(num_classes, device=device)
-    fn = torch.zeros(num_classes, device=device)
-    tn = torch.zeros(num_classes, device=device)
+    IGNORE_LABEL = -1
+    
+    # For presence metrics (image-level)
+    tp_cls = torch.zeros(num_classes, device=device)
+    fp_cls = torch.zeros(num_classes, device=device)
+    fn_cls = torch.zeros(num_classes, device=device)
+    tn_cls = torch.zeros(num_classes, device=device)
+    
+    # For segmentation IoU (pixel-level) - FIXED calculation
+    tp_per_class = torch.zeros(num_classes, device=device)
+    fp_per_class = torch.zeros(num_classes, device=device)
+    fn_per_class = torch.zeros(num_classes, device=device)
+    
     total_samples = 0
     pred_pos = torch.zeros(num_classes, device=device)
     prob_sum = torch.zeros(num_classes, device=device)
@@ -359,37 +439,92 @@ def validate(model, val_loader, classes, clip_model, device, threshold: float):
             if len(batch) != 4:
                 continue
 
-            imgs, _, label_vecs, _ = batch
+            imgs, gt_masks, label_vecs, _ = batch
             if imgs.shape[0] == 0:
                 continue
             
             imgs = imgs.to(device)
+            gt_masks = gt_masks.to(device)  # [B, H, W] with class indices, -1 for ignore
             label_vecs = label_vecs.to(device).float()
 
             toks = encode_image_to_tokens(clip_model, imgs)
-            logits, _, _ = model(toks[:, 1:])
+            logits, act_maps, _ = model(toks[:, 1:])
 
             probs = torch.sigmoid(logits)
             preds = (probs > threshold).float()
             pred_pos += preds.sum(dim=0)
             prob_sum += probs.sum(dim=0)
 
-            tp += (preds * label_vecs).sum(dim=0)
-            fp += (preds * (1.0 - label_vecs)).sum(dim=0)
-            fn += ((1.0 - preds) * label_vecs).sum(dim=0)
-            tn += ((1.0 - preds) * (1.0 - label_vecs)).sum(dim=0)
+            # Image-level presence metrics
+            tp_cls += (preds * label_vecs).sum(dim=0)
+            fp_cls += (preds * (1.0 - label_vecs)).sum(dim=0)
+            fn_cls += ((1.0 - preds) * label_vecs).sum(dim=0)
+            tn_cls += ((1.0 - preds) * (1.0 - label_vecs)).sum(dim=0)
+            
+            # Pixel-level segmentation IoU - Use unified helper function
+            # Generate pseudo masks for each sample in batch
+            batch_pred_masks = []
+            batch_gt_masks = []
+            
+            for b in range(imgs.shape[0]):
+                gt_mask = gt_masks[b]  # [H, W]
+                act_map_b = act_maps[b:b+1]  # [1, C, H', W']
+                logit_b = logits[b:b+1]  # [1, C]
+                
+                # Create pseudo mask
+                pred_mask = _create_pseudo_mask(act_map_b, logit_b, threshold)  # [H, W]
+                
+                # Resize to match GT if needed
+                if pred_mask.shape != gt_mask.shape:
+                    pred_mask = F.interpolate(
+                        pred_mask[None, None].float(),
+                        size=gt_mask.shape,
+                        mode="nearest"
+                    ).squeeze(0).squeeze(0).long()
+                
+                batch_pred_masks.append(pred_mask)
+                batch_gt_masks.append(gt_mask)
+            
+            # Use unified IoU calculation function
+            if batch_pred_masks:
+                batch_pred = torch.stack(batch_pred_masks, dim=0)  # [B, H, W]
+                batch_gt = torch.stack(batch_gt_masks, dim=0)  # [B, H, W]
+                
+                tp_batch, fp_batch, fn_batch, ious_batch, _ = compute_segmentation_iou_batch(
+                    batch_gt, batch_pred, num_classes, ignore_label=IGNORE_LABEL
+                )
+                
+                tp_per_class += tp_batch
+                fp_per_class += fp_batch
+                fn_per_class += fn_batch
+            
             total_samples += imgs.shape[0]
 
     if total_samples == 0:
         return None
 
-    metrics = compute_presence_metrics(tp, fp, fn, tn, classes)
+    # Calculate segmentation mIoU using unified function
+    ious_tensor, seg_miou = _compute_iou_from_counts(tp_per_class, fp_per_class, fn_per_class, eps=1e-7)
+    ious = ious_tensor.cpu().tolist()
+
+    # Image-level presence metrics
+    metrics = compute_presence_metrics(tp_cls, fp_cls, fn_cls, tn_cls, classes)
     metrics["summary"]["num_samples"] = total_samples
     metrics["summary"]["pred_pos_counts"] = pred_pos.detach().cpu().tolist()
     metrics["summary"]["mean_probs"] = (prob_sum / max(total_samples, 1)).detach().cpu().tolist()
+    
+    # Add segmentation IoU metrics
+    metrics["summary"]["seg_mIoU"] = seg_miou
+    metrics["summary"]["seg_per_class_iou"] = ious
+    
     for cls_idx, cls in enumerate(classes):
         metrics["per_class"][cls]["predicted"] = float(pred_pos[cls_idx].item())
         metrics["per_class"][cls]["mean_prob"] = float(prob_sum[cls_idx].item() / max(total_samples, 1))
+        metrics["per_class"][cls]["seg_iou"] = float(ious[cls_idx])
+        metrics["per_class"][cls]["seg_tp"] = float(tp_per_class[cls_idx].item())
+        metrics["per_class"][cls]["seg_fp"] = float(fp_per_class[cls_idx].item())
+        metrics["per_class"][cls]["seg_fn"] = float(fn_per_class[cls_idx].item())
+    
     return metrics
 
 
@@ -429,6 +564,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output", type=str, default=None,
                         help="Output checkpoint path (default: data_root/classnet_pp_stage2_1_prograd.pt)")
+    parser.add_argument("--viz_image_paths", type=str, nargs="+", default=None,
+                        help="Image paths to visualize pseudo masks after each epoch")
+    parser.add_argument("--viz_output_dir", type=str, default=None,
+                        help="Directory to save custom pseudo mask visualizations (default: data_root/train_pseudo)")
+    parser.add_argument("--viz_max_samples", type=int, default=5,
+                        help="Maximum number of custom images to visualize per epoch")
     
     args = parser.parse_args()
     
@@ -660,6 +801,10 @@ def main():
                 pred_count = cls_metrics.get("predicted", 0.0)
                 pred_ratio = pred_count / num_samples * 100.0
                 mean_prob = cls_metrics.get("mean_prob", 0.0) * 100.0
+                seg_iou = cls_metrics.get("seg_iou", 0.0) * 100.0
+                seg_tp = cls_metrics.get("seg_tp", 0.0)
+                seg_fp = cls_metrics.get("seg_fp", 0.0)
+                seg_fn = cls_metrics.get("seg_fn", 0.0)
                 print(
                     f"  >> {cls:25}: "
                     f"Supp {cls_metrics['support']:.0f} | "
@@ -669,7 +814,8 @@ def main():
                     f"Prec {cls_metrics['precision']*100:.2f}% | "
                     f"Rec {cls_metrics['recall']*100:.2f}% | "
                     f"F1 {cls_metrics['f1']*100:.2f}% | "
-                    f"IoU {cls_metrics['iou']*100:.2f}% | "
+                    f"PresIoU {cls_metrics['iou']*100:.2f}% | "
+                    f"SegIoU {seg_iou:.2f}% (TP={seg_tp:.0f}, FP={seg_fp:.0f}, FN={seg_fn:.0f}) | "
                     f"Dice {cls_metrics['dice']*100:.2f}% | "
                     f"bIoU {cls_metrics['biou']*100:.2f}%"
                 )
@@ -691,6 +837,26 @@ def main():
                     print(f"[Viz] Saved validation previews: {len(preview_paths)} images")
                     for saved_path in preview_paths:
                         print(f"  - {saved_path}")
+            custom_viz_paths = args.viz_image_paths or []
+            if custom_viz_paths:
+                viz_output_dir = args.viz_output_dir or os.path.join(args.data_root, "train_pseudo")
+                custom_saved = visualize_custom_images(
+                    classnet,
+                    clip_model,
+                    custom_viz_paths,
+                    classes_no_bg,
+                    device,
+                    args.presence_threshold,
+                    epoch,
+                    viz_output_dir,
+                    eval_transform,
+                    max_samples=args.viz_max_samples,
+                )
+                if custom_saved:
+                    summary["custom_viz_samples"] = custom_saved
+                    print(f"[Viz] Saved custom pseudo masks: {len(custom_saved)} images")
+                    for saved_path in custom_saved:
+                        print(f"  - {saved_path}")
             print("-" * 40)
             print(
                 "Mean Acc {0:.2f}% | Mean Prec {1:.2f}% | Mean Rec {2:.2f}% | Mean F1 {3:.2f}%".format(
@@ -701,13 +867,15 @@ def main():
                 )
             )
             print(
-                "mIoU {0:.2f}% | FwIoU {1:.2f}% | Mean bIoU {2:.2f}% | Mean Dice {3:.2f}%".format(
+                "Presence mIoU {0:.2f}% | FwIoU {1:.2f}% | Mean bIoU {2:.2f}% | Mean Dice {3:.2f}%".format(
                     summary["mIoU"] * 100,
                     summary["FwIoU"] * 100,
                     summary["mean_bIoU"] * 100,
                     summary["mean_dice"] * 100,
                 )
             )
+            seg_miou = summary.get("seg_mIoU", 0.0) * 100.0
+            print(f"Segmentation mIoU (FIXED): {seg_miou:.2f}%")
 
             mean_acc = summary["mean_accuracy"] * 100.0
             if mean_acc > best_metric:

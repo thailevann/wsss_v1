@@ -1,14 +1,3 @@
-# MIDL Project - Prototype-based Segmentation
-
-Dự án này sử dụng CLIP và các prototype để thực hiện segmentation cho histopathology images.
-
-## Tính năng tự động xử lý chiều (Auto-dimension handling)
-
-Tất cả các script đều tự động phát hiện và xử lý các chiều khác nhau:
-- Text prototype có thể có shape `[512]` hoặc `[2, 512]` - hệ thống tự động xử lý
-- Visual prototype có thể có shape `[16, 512]` hoặc `[512]` - hệ thống tự động xử lý
-- Tất cả các bước sau sẽ tự động adapt theo chiều đã phát hiện
-
 ## Cấu trúc thư mục
 
 ```
@@ -123,10 +112,8 @@ Tùy chọn:
 - `--caa_thr`: CAA threshold (default: 0.20)
 - `--conf_thr`: Confidence threshold (default: 0.05)
 
-**Tự động phát hiện**: 
-- INPUT_DIM và PROTO_DIM tự động phát hiện từ checkpoint và hybrid prototypes
 
-## Ví dụ workflow đầy đủ
+
 
 ```bash
 # 1. Build text prototypes
@@ -143,6 +130,12 @@ python build_hybrid_prototypes.py --data_root ./BCSS-WSSS
 
 # 5. Train ClassNet++
 python train.py --data_root ./BCSS-WSSS --num_epochs 5
+
+python train.py \
+  --data_root /path/to/data \
+  --viz_image_paths /path/to/img1.png /path/to/img2.png \
+  --viz_output_dir /path/to/output_dir \
+  [các tham số train khác...]
 
 # 6. Evaluate
 python eval.py --data_root ./BCSS-WSSS

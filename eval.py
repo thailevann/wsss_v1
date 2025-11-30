@@ -19,7 +19,7 @@ import cv2
 import clip
 from model.classnet import ClassNetPP
 from model.clip_encoder import encode_image_to_tokens
-from utils import mask_to_class_indices, compute_presence_metrics
+from utils import mask_to_class_indices, compute_presence_metrics, compute_segmentation_iou, _compute_iou_from_counts
 
 IGNORE_LABEL = -1
 
@@ -326,6 +326,11 @@ def main():
     
     print(f"Using INPUT_DIM={INPUT_DIM}, PROTO_DIM={PROTO_DIM}")
     
+    # Load model configuration from checkpoint if available
+    config = ckpt.get("config", {})
+    tau = config.get("tau", 0.25)
+    prograd_alpha = config.get("prograd_alpha", 0.7)
+    
     noise_tensor = ckpt["state_dict"].get("prograd.noise_protos")
     if noise_tensor is not None:
         noise_tensor = noise_tensor.to(device)
@@ -335,10 +340,24 @@ def main():
         INPUT_DIM,
         PROTO_DIM,
         noise_protos=noise_tensor,
+        tau=tau,
+        prograd_alpha=prograd_alpha,
     ).to(device)
+    
+    # FIXED: Ensure model is in eval mode and disable any randomness
     classnet.load_state_dict(ckpt["state_dict"])
     classnet.eval()
-    print("Model loaded for evaluation.")
+    
+    # Ensure all parameters are in eval mode (disable dropout, batch norm updates, etc.)
+    for module in classnet.modules():
+        if isinstance(module, (torch.nn.Dropout, torch.nn.BatchNorm2d, torch.nn.BatchNorm1d)):
+            module.eval()
+    
+    # Set deterministic behavior for reproducibility
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    print("Model loaded for evaluation (eval mode, deterministic).")
     
     use_caa = not args.no_caa
     if not use_caa:
@@ -554,7 +573,14 @@ def main():
         else:
             sample["pred_final_np"] = sample["pred_conf_np"]
 
-    hist = torch.zeros(NUM_CLASSES, NUM_CLASSES, device=device)
+    # FIXED: Calculate IoU correctly by counting TP, FP, FN for each class
+    # Only consider pixels where GT is valid (>= 0 and < NUM_CLASSES)
+    # This ensures we properly count False Negatives (GT has class but pred is IGNORE_LABEL)
+    tp_per_class = torch.zeros(NUM_CLASSES, device=device)
+    fp_per_class = torch.zeros(NUM_CLASSES, device=device)
+    fn_per_class = torch.zeros(NUM_CLASSES, device=device)
+    
+    hist = torch.zeros(NUM_CLASSES, NUM_CLASSES, device=device)  # For confusion matrix visualization
     tp_cls = torch.zeros(NUM_CLASSES, device=device)
     fp_cls = torch.zeros(NUM_CLASSES, device=device)
     fn_cls = torch.zeros(NUM_CLASSES, device=device)
@@ -565,14 +591,26 @@ def main():
         gt_tensor = torch.from_numpy(sample["gt_np"].astype(np.int64)).to(device)
         pred_tensor = torch.from_numpy(sample["pred_final_np"].astype(np.int64)).to(device)
 
-        valid = (gt_tensor >= 0) & (gt_tensor < NUM_CLASSES) & (pred_tensor >= 0)
-        if valid.sum() == 0:
+        # Only consider pixels where GT is valid (>= 0 and < NUM_CLASSES)
+        gt_valid = (gt_tensor >= 0) & (gt_tensor < NUM_CLASSES)
+        if gt_valid.sum() == 0:
             continue
 
-        hist += torch.bincount(
-            NUM_CLASSES * gt_tensor[valid] + pred_tensor[valid],
-            minlength=NUM_CLASSES ** 2,
-        ).view(NUM_CLASSES, NUM_CLASSES)
+        # For confusion matrix: count pixels where both GT and pred are valid
+        both_valid = gt_valid & (pred_tensor >= 0) & (pred_tensor < NUM_CLASSES)
+        if both_valid.sum() > 0:
+            hist += torch.bincount(
+                NUM_CLASSES * gt_tensor[both_valid] + pred_tensor[both_valid],
+                minlength=NUM_CLASSES ** 2,
+            ).view(NUM_CLASSES, NUM_CLASSES)
+
+        # Use unified IoU calculation function
+        tp_sample, fp_sample, fn_sample, _, _ = compute_segmentation_iou(
+            gt_tensor, pred_tensor, NUM_CLASSES, ignore_label=IGNORE_LABEL
+        )
+        tp_per_class += tp_sample
+        fp_per_class += fp_sample
+        fn_per_class += fn_sample
 
         pred_labels = torch.zeros(NUM_CLASSES, device=device)
         for ci in range(NUM_CLASSES):
@@ -596,20 +634,46 @@ def main():
             }
         )
 
-    # Calculate mIoU
+    # Calculate mIoU - FIXED: Use correct TP, FP, FN counts
+    # Only count pixels where GT is valid (>= 0 and < NUM_CLASSES)
+    # This ensures False Negatives are properly counted (GT has class but pred is IGNORE_LABEL)
     ious = []
     print("\n" + "=" * 40)
     print(f"PSEUDO MASK EVALUATION RESULTS ({result_label})")
     print("=" * 40)
+    
+    total_valid_pixels = 0
+    total_ignore_pixels = 0
+    for sample in samples:
+        pred_tensor = torch.from_numpy(sample["pred_final_np"].astype(np.int64)).to(device)
+        gt_tensor = torch.from_numpy(sample["gt_np"].astype(np.int64)).to(device)
+        gt_valid = (gt_tensor >= 0) & (gt_tensor < NUM_CLASSES)
+        total_valid_pixels += gt_valid.sum().item()
+        total_ignore_pixels += ((pred_tensor < 0) & gt_valid).sum().item()
+    
+    if total_valid_pixels > 0:
+        ignore_ratio = total_ignore_pixels / total_valid_pixels
+        if ignore_ratio > 0.5:
+            print(f"[WARNING] {ignore_ratio*100:.1f}% of valid GT pixels are IGNORE_LABEL in predictions.")
+            print(f"         This may indicate conf_thr is too high or model predictions are too weak.")
+            print(f"         IoU scores may be misleading if most predictions are ignored.")
 
+    # Calculate IoU using unified function
+    ious_tensor, miou = _compute_iou_from_counts(tp_per_class, fp_per_class, fn_per_class, eps=1e-7)
+    ious = ious_tensor.cpu().tolist()
+    
     for i, c in enumerate(classes_no_bg):
-        cls_tp = hist[i, i]
-        union = hist[i, :].sum() + hist[:, i].sum() - cls_tp
-        iou = (cls_tp / (union + 1e-7)).item()
-        ious.append(iou)
-        print(f"Class {c:<25}: {iou * 100:.2f}%")
-
-    miou = sum(ious) / len(ious)
+        cls_tp = tp_per_class[i].item()
+        cls_fp = fp_per_class[i].item()
+        cls_fn = fn_per_class[i].item()
+        union = cls_tp + cls_fp + cls_fn
+        iou = ious[i]
+        if union > 0:
+            precision = cls_tp / (cls_tp + cls_fp + 1e-7)
+            recall = cls_tp / (cls_tp + cls_fn + 1e-7)
+            print(f"Class {c:<25}: IoU={iou * 100:.2f}% | TP={cls_tp:.0f}, FP={cls_fp:.0f}, FN={cls_fn:.0f} | Prec={precision*100:.1f}%, Rec={recall*100:.1f}%")
+        else:
+            print(f"Class {c:<25}: IoU=N/A (no pixels with this class in GT or predictions)")
     print("-" * 40)
     print(f"MEAN IOU (mIoU)                       : {miou * 100:.2f}%")
     print("=" * 40)
@@ -656,7 +720,7 @@ def main():
             mask.save(out_path)
         print(f"[INFO] Saved {len(pseudo_outputs)} pseudo masks to {args.save_pseudo_dir}")
 
-    cmap = mcolors.ListedColormap(['red', 'green', 'blue', 'yellow'])
+    cmap = mcolors.ListedColormap(['red', 'green', 'blue', 'purple'])
     norm = mcolors.BoundaryNorm(np.arange(NUM_CLASSES + 1) - 0.5, NUM_CLASSES)
 
     visual_samples = pseudo_outputs[: min(args.num_visualize, len(pseudo_outputs))]

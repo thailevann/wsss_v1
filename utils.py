@@ -138,6 +138,158 @@ def mask_to_class_indices(mask_pil, classes: List[str]) -> Tuple[np.ndarray, Lis
 # Metrics helpers
 # -----------------------------------------------------------------------------
 
+def _compute_iou_from_counts(
+    tp: torch.Tensor,
+    fp: torch.Tensor,
+    fn: torch.Tensor,
+    eps: float = 1e-7,
+) -> Tuple[torch.Tensor, float]:
+    """
+    Compute IoU from TP, FP, FN counts (unified calculation).
+    
+    Args:
+        tp: [num_classes] True Positives per class
+        fp: [num_classes] False Positives per class
+        fn: [num_classes] False Negatives per class
+        eps: Small epsilon to avoid division by zero
+    
+    Returns:
+        Tuple of (ious, miou):
+        - ious: [num_classes] IoU per class
+        - miou: Mean IoU (scalar)
+    """
+    num_classes = tp.shape[0]
+    ious = torch.zeros_like(tp, dtype=torch.float32)
+    
+    for ci in range(num_classes):
+        cls_tp = tp[ci].item()
+        cls_fp = fp[ci].item()
+        cls_fn = fn[ci].item()
+        union = cls_tp + cls_fp + cls_fn
+        iou = cls_tp / (union + eps)
+        ious[ci] = iou
+    
+    miou = ious.mean().item()
+    return ious, miou
+
+
+def compute_segmentation_iou(
+    gt_mask: torch.Tensor,
+    pred_mask: torch.Tensor,
+    num_classes: int,
+    ignore_label: int = -1,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """
+    Compute segmentation IoU metrics with correct calculation.
+    
+    FIXED: Only considers pixels where GT is valid (>= 0 and < num_classes).
+    This ensures False Negatives are properly counted (GT has class but pred is IGNORE_LABEL).
+    
+    Args:
+        gt_mask: Ground truth mask [H, W] with class indices, -1 for ignore
+        pred_mask: Prediction mask [H, W] with class indices, -1 for ignore
+        num_classes: Number of classes
+        ignore_label: Label value for ignored pixels (default: -1)
+    
+    Returns:
+        Tuple of (tp_per_class, fp_per_class, fn_per_class, ious, miou):
+        - tp_per_class: [num_classes] True Positives per class
+        - fp_per_class: [num_classes] False Positives per class
+        - fn_per_class: [num_classes] False Negatives per class
+        - ious: [num_classes] IoU per class
+        - miou: Mean IoU (scalar)
+    """
+    device = gt_mask.device
+    eps = 1e-7
+    
+    # Ensure both are on same device and same dtype
+    if isinstance(gt_mask, np.ndarray):
+        gt_mask = torch.from_numpy(gt_mask).long().to(device)
+    if isinstance(pred_mask, np.ndarray):
+        pred_mask = torch.from_numpy(pred_mask).long().to(device)
+    
+    gt_mask = gt_mask.long().to(device)
+    pred_mask = pred_mask.long().to(device)
+    
+    # Only consider pixels where GT is valid (>= 0 and < num_classes)
+    gt_valid = (gt_mask >= 0) & (gt_mask < num_classes)
+    if gt_valid.sum() == 0:
+        # No valid GT pixels, return zeros
+        tp_per_class = torch.zeros(num_classes, device=device)
+        fp_per_class = torch.zeros(num_classes, device=device)
+        fn_per_class = torch.zeros(num_classes, device=device)
+        ious = torch.zeros(num_classes, device=device)
+        return tp_per_class, fp_per_class, fn_per_class, ious, 0.0
+    
+    # Calculate TP, FP, FN for each class
+    tp_per_class = torch.zeros(num_classes, device=device)
+    fp_per_class = torch.zeros(num_classes, device=device)
+    fn_per_class = torch.zeros(num_classes, device=device)
+    
+    for ci in range(num_classes):
+        gt_class_i = (gt_mask == ci) & gt_valid
+        pred_class_i = (pred_mask == ci) & gt_valid
+        
+        # TP: both GT and pred are class i
+        tp_per_class[ci] = (gt_class_i & pred_class_i).sum()
+        # FP: pred is class i but GT is not class i (and GT is valid)
+        fp_per_class[ci] = (pred_class_i & ~gt_class_i).sum()
+        # FN: GT is class i but pred is not class i (including IGNORE_LABEL)
+        fn_per_class[ci] = (gt_class_i & ~pred_class_i).sum()
+    
+    # Calculate IoU using unified function
+    ious, miou = _compute_iou_from_counts(tp_per_class, fp_per_class, fn_per_class, eps=eps)
+    
+    return tp_per_class, fp_per_class, fn_per_class, ious, miou
+
+
+def compute_segmentation_iou_batch(
+    gt_masks: torch.Tensor,
+    pred_masks: torch.Tensor,
+    num_classes: int,
+    ignore_label: int = -1,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """
+    Compute segmentation IoU metrics for a batch of masks.
+    
+    Args:
+        gt_masks: Ground truth masks [B, H, W] or [H, W]
+        pred_masks: Prediction masks [B, H, W] or [H, W]
+        num_classes: Number of classes
+        ignore_label: Label value for ignored pixels (default: -1)
+    
+    Returns:
+        Tuple of (tp_per_class, fp_per_class, fn_per_class, ious, miou)
+    """
+    device = gt_masks.device if isinstance(gt_masks, torch.Tensor) else torch.device('cpu')
+    
+    # Handle single mask case
+    if gt_masks.dim() == 2:
+        gt_masks = gt_masks.unsqueeze(0)
+        pred_masks = pred_masks.unsqueeze(0)
+    
+    batch_size = gt_masks.shape[0]
+    
+    # Accumulate TP, FP, FN across batch
+    tp_per_class = torch.zeros(num_classes, device=device)
+    fp_per_class = torch.zeros(num_classes, device=device)
+    fn_per_class = torch.zeros(num_classes, device=device)
+    
+    for b in range(batch_size):
+        tp_b, fp_b, fn_b, _, _ = compute_segmentation_iou(
+            gt_masks[b], pred_masks[b], num_classes, ignore_label
+        )
+        tp_per_class += tp_b
+        fp_per_class += fp_b
+        fn_per_class += fn_b
+    
+    # Calculate IoU using unified function
+    eps = 1e-7
+    ious, miou = _compute_iou_from_counts(tp_per_class, fp_per_class, fn_per_class, eps=eps)
+    
+    return tp_per_class, fp_per_class, fn_per_class, ious, miou
+
+
 def compute_presence_metrics(
     tp: torch.Tensor,
     fp: torch.Tensor,
